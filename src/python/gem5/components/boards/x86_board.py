@@ -35,9 +35,9 @@ from m5.objects import (
     AddrRange,
     BaseXBar,
     Bridge,
+    CowDiskImage,
     CXLBridge,
     CXLMemBar,
-    CowDiskImage,
     IdeDisk,
     IOXBar,
     Pc,
@@ -82,14 +82,21 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cache_hierarchy: AbstractCacheHierarchy,
         cxl_memory: AbstractMemorySystem,
         is_asic: bool,
+        enable_nmp: bool = False,
     ) -> None:
+        # Set NMP flag BEFORE super().__init__() so it's available during _setup_io_devices()
+        # Use object.__setattr__() to bypass gem5's SimObject attribute checking
+        # This creates a regular Python attribute, not a gem5 SimObject parameter
+        object.__setattr__(self, "enable_nmp", enable_nmp)
+
         super().__init__(
             clk_freq=clk_freq,
             processor=processor,
             memory=memory,
             cache_hierarchy=cache_hierarchy,
             cxl_memory=cxl_memory,
-            is_asic=is_asic
+            is_asic=is_asic,
+            # Note: enable_nmp is NOT passed to parent - it's X86Board-specific
         )
 
         if self.get_processor().get_isa() != ISA.X86:
@@ -129,7 +136,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
         # Setup memory system specific settings.
         if self.get_cache_hierarchy().is_ruby():
-            self.pc.attachIO(self.get_io_bus(), [self.pc.south_bridge.ide.dma, self.pc.south_bridge.cxlmemory.dma])
+            self.pc.attachIO(
+                self.get_io_bus(),
+                [
+                    self.pc.south_bridge.ide.dma,
+                    self.pc.south_bridge.cxlmemory.dma,
+                ],
+            )
         else:
             # # Constants similar to x86_traits.hh
             IO_address_space_base = 0x8000000000000000
@@ -137,8 +150,20 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             interrupts_address_space_base = 0xA000000000000000
             APIC_range_size = 1 << 12
 
-            # Configure CXLBridge
-            self.bridge = CXLBridge(bridge_lat="50ns", proto_proc_lat="12ns", req_fifo_depth=128, resp_fifo_depth=128)
+            # Configure CXL Device first to get address range
+            cxl_mem_start = 0x100000000
+            cxl_dram = self.get_cxl_memory()
+            cxl_mem_range = AddrRange(
+                Addr(cxl_mem_start), size=cxl_dram.get_size()
+            )
+
+            # Configure CXLBridge (Host CPU path: Core 0)
+            self.bridge = CXLBridge(
+                bridge_lat="50ns",
+                proto_proc_lat="12ns",
+                req_fifo_depth=128,
+                resp_fifo_depth=128,
+            )
             self.bridge.mem_side_port = self.get_io_bus().cpu_side_ports
             self.bridge.cpu_side_port = (
                 self.get_cache_hierarchy().get_mem_side_port()
@@ -151,11 +176,6 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 ),
                 AddrRange(pci_config_address_space_base, Addr.max),
             ]
-
-            # Configure CXL Device
-            cxl_mem_start = 0x100000000
-            cxl_dram = self.get_cxl_memory()
-            cxl_mem_range = AddrRange(Addr(cxl_mem_start), size=cxl_dram.get_size())
             self.bridge.ranges.append(cxl_mem_range)
             self.pc.south_bridge.cxlmemory.cxl_mem_range = cxl_mem_range
             cxl_dram.set_memory_range([cxl_mem_range])
@@ -164,7 +184,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 cxl_abstract_mems.append(mc.dram)
             self.memories.extend(cxl_abstract_mems)
             self.cxl_mem_bus = CXLMemBar()
-            self.cxl_mem_bus.cpu_side_ports = self.pc.south_bridge.cxlmemory.mem_req_port
+            self.cxl_mem_bus.cpu_side_ports = (
+                self.pc.south_bridge.cxlmemory.mem_req_port
+            )
             for _, port in cxl_dram.get_mem_ports():
                 self.cxl_mem_bus.mem_side_ports = port
 
@@ -177,6 +199,80 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 self.pc.south_bridge.cxlmemory.proto_proc_lat = Latency("60ns")
                 self.pc.south_bridge.cxlmemory.rsp_size = 36
                 self.pc.south_bridge.cxlmemory.req_size = 36
+
+            # NMP (Near-Memory Processing) Direct Path Setup
+            # When enable_nmp is True, create a secondary direct bridge for Core 1
+            # that bypasses the CXL Bridge and CXL Memory device overhead
+            if self.enable_nmp:
+                from m5.objects import RangeAddrMapper
+
+                # Use DIFFERENT address range for NMP path (address-based routing)
+                # Normal CXL: 0x100000000-0x2FFFFFFFF (8GB)
+                # NMP direct: 0x300000000-0x4FFFFFFFF (next 8GB)
+                nmp_mem_start = Addr(0x300000000)  # 12GB offset
+                nmp_mem_range = AddrRange(
+                    nmp_mem_start, size=cxl_dram.get_size()
+                )
+
+                # Create address mapper to translate NMP addresses to CXL memory addresses
+                # Maps 0x300000000 -> 0x100000000
+                self.nmp_addr_mapper = RangeAddrMapper()
+                self.nmp_addr_mapper.original_ranges = [nmp_mem_range]
+                self.nmp_addr_mapper.remapped_ranges = [cxl_mem_range]
+
+                # Create NMP direct bridge: L3 Cache → Address Mapper → CXL Memory Bus
+                # This bypasses: CXLBridge (62ns) + CXLMemory device (15ns) = ~77ns
+                self.nmp_bridge = Bridge(delay="1ns")  # Minimal crossbar delay
+
+                # Connect bridge: CPU side to cache hierarchy
+                self.nmp_bridge.cpu_side_port = (
+                    self.get_cache_hierarchy().get_mem_side_port()
+                )
+                self.nmp_bridge.ranges = [nmp_mem_range]
+
+                # Connect bridge mem side to address mapper
+                self.nmp_bridge.mem_side_port = (
+                    self.nmp_addr_mapper.cpu_side_port
+                )
+
+                # Connect address mapper to CXL memory bus
+                self.nmp_addr_mapper.mem_side_port = (
+                    self.cxl_mem_bus.cpu_side_ports
+                )
+
+                # Store config using object.__setattr__() since it's just a dict, not a SimObject
+                object.__setattr__(
+                    self,
+                    "nmp_config",
+                    {
+                        "enabled": True,
+                        "host_range": cxl_mem_range,
+                        "nmp_range": nmp_mem_range,
+                    },
+                )
+
+                print("=" * 80)
+                print(
+                    "[NMP] Near-Memory Processing enabled - Address-based routing:"
+                )
+                print(
+                    f"[NMP]   Host path (Core 0):  0x{int(cxl_mem_start):X} - 0x{int(cxl_mem_start) + cxl_dram.get_size() - 1:X}"
+                )
+                print(
+                    f"[NMP]   NMP path (Core 1):   0x{int(nmp_mem_start):X} - 0x{int(nmp_mem_start) + cxl_dram.get_size() - 1:X}"
+                )
+                print(
+                    f"[NMP]   Core 0: L3 → MemBus → CXLBridge → IOBus → CXLMemory → CXL_Mem_Bus"
+                )
+                print(
+                    f"[NMP]   Core 1: L3 → MemBus → NMP_Bridge → CXL_Mem_Bus (DIRECT)"
+                )
+                print(
+                    f"[NMP]   Bypass savings: ~77ns (CXLBridge 62ns + CXLMemory 15ns)"
+                )
+                print("=" * 80)
+            else:
+                object.__setattr__(self, "nmp_config", {"enabled": False})
 
             self.apicbridge = Bridge(delay="50ns")
             self.apicbridge.cpu_side_port = self.get_io_bus().mem_side_ports
@@ -286,7 +382,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             X86E820Entry(addr=0xFFFF0000, size="64kB", range_type=2)
         )
 
-        entries.append(X86E820Entry(addr=0x100000000, size=f"{cxl_mem_range.size()}B", range_type=1))
+        entries.append(
+            X86E820Entry(
+                addr=0x100000000, size=f"{cxl_mem_range.size()}B", range_type=1
+            )
+        )
 
         self.workload.e820_table.entries = entries
 
@@ -304,7 +404,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
     @overrides(AbstractSystemBoard)
     def get_dma_ports(self) -> Sequence[Port]:
-        return [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, self.pc.south_bridge.cxlmemory.dma]
+        return [
+            self.pc.south_bridge.ide.dma,
+            self.iobus.mem_side_ports,
+            self.pc.south_bridge.cxlmemory.dma,
+        ]
 
     @overrides(AbstractSystemBoard)
     def has_coherent_io(self) -> bool:

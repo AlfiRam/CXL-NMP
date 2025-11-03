@@ -1,0 +1,91 @@
+/**
+ * Memory Stride Access Microbenchmark for NMP Research
+ *
+ * Configuration (matching lmbench settings):
+ * - 128 MB array (larger than 96 MB LLC, ensures pure memory access)
+ * - 64-byte stride (cache line size)
+ * - 10K accesses with sequential stride pattern
+ *
+ * Address-based routing:
+ * - Host path (Core 0): 0x100000000 - 0x2FFFFFFFF
+ * - NMP path (Core 1):  0x300000000 - 0x4FFFFFFFF
+ *
+ * Usage:
+ *   NMP_CORE=0 taskset -c 0 ./memory_stride_access  # Host baseline
+ *   NMP_CORE=1 taskset -c 1 ./memory_stride_access  # NMP direct
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+
+#include <gem5/m5ops.h>
+
+// Configuration (matching paper's lmbench settings)
+// 128 MB (larger than 96 MB LLC, ensures pure memory access)
+#define SIZE (128ULL * 1024 * 1024)
+#define ACCESSES 10000  // 10K random accesses
+#define STRIDE 64  // 64 bytes (cache line size)
+
+// Address ranges for host and NMP paths
+#define HOST_BASE_ADDR  0x100000000ULL  // Host CXL path
+#define NMP_BASE_ADDR   0x300000000ULL  // NMP direct path
+
+int main() {
+    // Determine which core we're running on via environment variable
+    char *nmp_core_env = getenv("NMP_CORE");
+    int is_nmp_core = (nmp_core_env != NULL && atoi(nmp_core_env) == 1);
+
+    // Select base address based on core
+    uint64_t base_addr = is_nmp_core ? NMP_BASE_ADDR : HOST_BASE_ADDR;
+
+    printf("=== Memory Stride Benchmark ===\n");
+    printf("Core type: %s\n", is_nmp_core ? "NMP (Core 1)" : "Host (Core 0)");
+    printf("Base address: 0x%llX\n", (unsigned long long)base_addr);
+    printf("Size: %llu MB\n", (unsigned long long)(SIZE / (1024UL * 1024)));
+    printf("================================\n");
+
+    // Use mmap to allocate at specific address
+    char *data = (char*)mmap(
+        (void*)base_addr,           // Requested address
+        SIZE,                        // Size
+        PROT_READ | PROT_WRITE,     // Permissions
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,  // Flags
+        -1,                         // No file descriptor
+        0                           // No offset
+    );
+
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for address 0x%lX\n", base_addr);
+        return 1;
+    }
+
+    printf("Memory mapped at: %p\n", (void*)data);
+
+    // Initialize memory to ensure pages are allocated
+    printf("Initializing memory...\n");
+    memset(data, 0, SIZE);
+
+    // Accumulator to prevent compiler optimization
+    volatile uint64_t sum = 0;
+
+    // RESET STATS - The absolute last thing before the loop
+    m5_reset_stats(0, 0);
+
+    // Sequential stride pattern
+    for (int i = 0; i < ACCESSES; i++) {
+        size_t idx = (i * STRIDE) % SIZE;
+        sum += data[idx];
+    }
+
+    // Dump stats
+    m5_dump_stats(0, 0);
+
+    printf("Benchmark complete\n");
+    printf("Checksum: %lu\n", (unsigned long)sum);
+
+    // Unmap memory
+    munmap(data, SIZE);
+    return 0;
+}
