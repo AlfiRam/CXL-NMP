@@ -185,6 +185,11 @@ command = (
     + "echo 'Path: L3 → MemBus → NMPBridge → CXL_Mem_Bus (DIRECT)';"
     + "echo 'Expected latency: ~230-305ns per access (1.25-1.7x faster than host)';"
     + "echo '';"
+    + "echo '[TASKSET] Pinning workload to Core 1 (NMP path)';"
+    + "echo '[TASKSET] Command: NMP_CORE=1 taskset -c 1 /home/cxl_benchmark/"
+    + args.test_cmd
+    + "';"
+    + "echo '';"
     + "NMP_CORE=1 taskset -c 1 /home/cxl_benchmark/"
     + args.test_cmd
     + ";"

@@ -14,6 +14,8 @@
  *   NMP_CORE=0 taskset -c 0 ./memory_stride_access  # Host baseline
  *   NMP_CORE=1 taskset -c 1 ./memory_stride_access  # NMP direct
  */
+#define _GNU_SOURCE
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +46,40 @@ int main() {
     printf("Core type: %s\n", is_nmp_core ? "NMP (Core 1)" : "Host (Core 0)");
     printf("Base address: 0x%llX\n", (unsigned long long)base_addr);
     printf("Size: %llu MB\n", (unsigned long long)(SIZE / (1024UL * 1024)));
+
+    // Verify which CPU we're actually running on
+    int actual_cpu = sched_getcpu();
+    printf("*** RUNNING ON CPU: %d ***\n", actual_cpu);
+
+    // Check CPU affinity mask for absolute proof
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        printf("CPU Affinity Mask: ");
+        for (int i = 0; i < 8; i++) {
+            if (CPU_ISSET(i, &mask)) {
+                printf("CPU%d ", i);
+            }
+        }
+        printf("\n");
+
+        // Count how many CPUs we're allowed to run on
+        int allowed_cpus = 0;
+        for (int i = 0; i < 8; i++) {
+            if (CPU_ISSET(i, &mask)) allowed_cpus++;
+        }
+        if (allowed_cpus == 1) {
+            printf("CONFIRMED: Process is pinned to single CPU\n");
+        } else {
+            printf("WARNING: Process can run on %d CPUs (not pinned!)\n",
+                   allowed_cpus);
+        }
+    }
+
+    if (actual_cpu != (is_nmp_core ? 1 : 0)) {
+        printf("WARNING: Expected CPU %d but running on CPU %d!\n",
+               is_nmp_core ? 1 : 0, actual_cpu);
+    }
     printf("================================\n");
 
     // Use mmap to allocate at specific address
@@ -84,6 +120,15 @@ int main() {
 
     printf("Benchmark complete\n");
     printf("Checksum: %lu\n", (unsigned long)sum);
+
+    // Verify we stayed on the same CPU throughout execution
+    int final_cpu = sched_getcpu();
+    printf("Final CPU check: %d ", final_cpu);
+    if (final_cpu == actual_cpu) {
+        printf("(STABLE - stayed on CPU %d)\n", final_cpu);
+    } else {
+        printf("(MIGRATED - started on CPU %d!)\n", actual_cpu);
+    }
 
     // Unmap memory
     munmap(data, SIZE);
