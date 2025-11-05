@@ -235,7 +235,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                     self.nmp_addr_mapper.cpu_side_port
                 )
 
-                # Connect address mapper to CXL memory bus
+                # Connect address mapper directly to cxl_mem_bus (BYPASS CXLMemory!)
+                # Key: cxl_mem_bus.cpu_side_ports is a VECTOR port (can accept multiple connections)
+                # Connection 1 (line 188): CXLMemory.mem_req_port (Host path goes THROUGH device)
+                # Connection 2 (here): NMP AddrMapper (NMP path BYPASSES device)
+                # Both paths share the same bus to DRAM, but NMP enters directly!
                 self.nmp_addr_mapper.mem_side_port = (
                     self.cxl_mem_bus.cpu_side_ports
                 )
@@ -262,13 +266,16 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                     f"[NMP]   NMP path (Core 1):   0x{int(nmp_mem_start):X} - 0x{int(nmp_mem_start) + cxl_dram.get_size() - 1:X}"
                 )
                 print(
-                    f"[NMP]   Core 0: L3 → MemBus → CXLBridge → IOBus → CXLMemory → CXL_Mem_Bus"
+                    f"[NMP]   Core 0: L3 → MemBus → CXLBridge(62ns) → IOBus → CXLMemory(15ns) → cxl_mem_bus → DRAM"
                 )
                 print(
-                    f"[NMP]   Core 1: L3 → MemBus → NMP_Bridge → CXL_Mem_Bus (DIRECT)"
+                    f"[NMP]   Core 1: L3 → MemBus → NMP_Bridge(1ns) → AddrMapper → cxl_mem_bus → DRAM (DIRECT)"
                 )
                 print(
-                    f"[NMP]   Bypass savings: ~77ns (CXLBridge 62ns + CXLMemory 15ns)"
+                    f"[NMP]   Both paths share cxl_mem_bus, but NMP bypasses CXLMemory device!"
+                )
+                print(
+                    f"[NMP]   Bypass savings: CXLBridge(62ns) + CXLMemory(15ns) = 77ns!"
                 )
                 print("=" * 80)
             else:

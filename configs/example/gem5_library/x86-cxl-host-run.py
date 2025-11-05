@@ -172,6 +172,11 @@ command = (
     + "echo 'Path: L3 → MemBus → CXLBridge → IOBus → CXLMemory → CXL_Mem_Bus';"
     + "echo 'Expected latency: ~382ns per access';"
     + "echo '';"
+    + "echo '[CPU INFO] Checking available CPUs in OS:';"
+    + "echo -n 'Number of CPUs: '; nproc;"
+    + "echo 'CPU List:'; cat /proc/cpuinfo | grep -E '^processor' | awk '{print \"  CPU \" $3}';"
+    + "echo 'Online CPUs:'; cat /sys/devices/system/cpu/online;"
+    + "echo '';"
     + "echo '[WORKLOAD] Running on Core 0 (Host path, no taskset needed)';"
     + "echo '[WORKLOAD] Command: NMP_CORE=0 /home/cxl_benchmark/"
     + args.test_cmd

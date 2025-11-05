@@ -1,10 +1,14 @@
 /**
- * Memory Stride Access Microbenchmark for NMP Research
+ * Memory Latency Microbenchmark for NMP Research (lmbench-style)
+ *
+ * Based on lmbench's pointer-chasing methodology for accurate memory
+ * latency measurement. Uses a circular linked list with configurable
+ * stride to defeat hardware prefetchers and measure true memory latency.
  *
  * Configuration (matching lmbench settings):
  * - 128 MB array (larger than 96 MB LLC, ensures pure memory access)
  * - 64-byte stride (cache line size)
- * - 10K accesses with sequential stride pattern
+ * - Pointer chasing pattern (defeats prefetcher)
  *
  * Address-based routing:
  * - Host path (Core 0): 0x100000000 - 0x2FFFFFFFF
@@ -24,17 +28,37 @@
 
 #include <gem5/m5ops.h>
 
-// Configuration (matching paper's lmbench settings)
+// Configuration (matching lmbench settings)
 // 128 MB (larger than 96 MB LLC, ensures pure memory access)
 #define SIZE (128ULL * 1024 * 1024)
-#define ACCESSES 10000  // 10K random accesses
 #define STRIDE 64  // 64 bytes (cache line size)
 
-// Address ranges for host and NMP paths
-#define HOST_BASE_ADDR  0x100000000ULL  // Host CXL path
-#define NMP_BASE_ADDR   0x300000000ULL  // NMP direct path
+// Number of pointer chases per iteration
+// lmbench uses 100, we'll use the same
+#define HUNDRED 100
 
-int main() {
+// Address ranges for host and NMP paths
+#define HOST_BASE_ADDR 0x100000000ULL  // Host CXL path
+#define NMP_BASE_ADDR 0x300000000ULL  // NMP direct path
+
+/**
+ * Initialize memory with lmbench-style pointer chasing pattern
+ * Creates a circular linked list where each pointer is separated by STRIDE
+ */
+void stride_initialize(char *base, size_t len, size_t stride)
+{
+    size_t i;
+
+    // Build circular linked list with stride
+    for (i = stride; i < len; i += stride) {
+        *(char **)&base[i - stride] = (char *)&base[i];
+    }
+    // Last element loops back to start
+    *(char **)&base[i - stride] = (char *)&base[0];
+}
+
+int main()
+{
     // Determine which core we're running on via environment variable
     char *nmp_core_env = getenv("NMP_CORE");
     int is_nmp_core = (nmp_core_env != NULL && atoi(nmp_core_env) == 1);
@@ -42,10 +66,13 @@ int main() {
     // Select base address based on core
     uint64_t base_addr = is_nmp_core ? NMP_BASE_ADDR : HOST_BASE_ADDR;
 
-    printf("=== Memory Stride Benchmark ===\n");
-    printf("Core type: %s\n", is_nmp_core ? "NMP (Core 1)" : "Host (Core 0)");
+    printf("=== Memory Latency Benchmark (lmbench-style) ===\n");
+    printf("Core type: %s\n",
+           is_nmp_core ? "NMP (Core 1)" : "Host (Core 0)");
     printf("Base address: 0x%llX\n", (unsigned long long)base_addr);
     printf("Size: %llu MB\n", (unsigned long long)(SIZE / (1024UL * 1024)));
+    printf("Stride: %d bytes\n", STRIDE);
+    printf("Pattern: Pointer chasing (defeats prefetcher)\n");
 
     // Verify which CPU we're actually running on
     int actual_cpu = sched_getcpu();
@@ -66,7 +93,8 @@ int main() {
         // Count how many CPUs we're allowed to run on
         int allowed_cpus = 0;
         for (int i = 0; i < 8; i++) {
-            if (CPU_ISSET(i, &mask)) allowed_cpus++;
+            if (CPU_ISSET(i, &mask))
+                allowed_cpus++;
         }
         if (allowed_cpus == 1) {
             printf("CONFIRMED: Process is pinned to single CPU\n");
@@ -83,43 +111,60 @@ int main() {
     printf("================================\n");
 
     // Use mmap to allocate at specific address
-    char *data = (char*)mmap(
-        (void*)base_addr,           // Requested address
-        SIZE,                        // Size
-        PROT_READ | PROT_WRITE,     // Permissions
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,  // Flags
-        -1,                         // No file descriptor
-        0                           // No offset
-    );
+    char *data =
+        (char *)mmap((void *)base_addr,  // Requested address
+                     SIZE,  // Size
+                     PROT_READ | PROT_WRITE,  // Permissions
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,  // Flags
+                     -1,  // No file descriptor
+                     0  // No offset
+        );
 
     if (data == MAP_FAILED) {
-        fprintf(stderr, "ERROR: mmap failed for address 0x%lX\n", base_addr);
+        fprintf(stderr, "ERROR: mmap failed for address 0x%lX\n",
+                base_addr);
         return 1;
     }
 
-    printf("Memory mapped at: %p\n", (void*)data);
+    printf("Memory mapped at: %p\n", (void *)data);
 
     // Initialize memory to ensure pages are allocated
-    printf("Initializing memory...\n");
-    memset(data, 0, SIZE);
+    printf("Initializing memory with pointer-chasing pattern...\n");
+    memset(data, 0, SIZE);  // Touch all pages first
 
-    // Accumulator to prevent compiler optimization
-    volatile uint64_t sum = 0;
+    // Build pointer-chasing linked list (lmbench style)
+    stride_initialize(data, SIZE, STRIDE);
+
+    // Calculate number of iterations
+    // We want to traverse the entire memory region multiple times
+    size_t chain_length = SIZE / STRIDE;  // Number of elements in chain
+    size_t iterations = chain_length * 10;  // 10 full traversals
+
+    printf("Chain elements: %zu\n", chain_length);
+    printf("Total pointer chases: %zu\n", iterations);
+    printf("Starting benchmark...\n");
 
     // RESET STATS - The absolute last thing before the loop
     m5_reset_stats(0, 0);
 
-    // Sequential stride pattern
-    for (int i = 0; i < ACCESSES; i++) {
-        size_t idx = (i * STRIDE) % SIZE;
-        sum += data[idx];
+    // Pointer chasing loop (lmbench style)
+    // This defeats hardware prefetchers because each access depends
+    // on the previous one
+    register char **p = (char **)data;
+    register size_t count = iterations;
+
+    while (count-- > 0) {
+        // Each iteration does one pointer dereference
+        // The next address can't be known until current load completes
+        p = (char **)*p;
     }
 
     // Dump stats
     m5_dump_stats(0, 0);
 
     printf("Benchmark complete\n");
-    printf("Checksum: %lu\n", (unsigned long)sum);
+    // Use the pointer to prevent optimization
+    printf("Final pointer: %p\n", (void *)p);
 
     // Verify we stayed on the same CPU throughout execution
     int final_cpu = sched_getcpu();
