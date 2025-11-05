@@ -5,10 +5,12 @@
  * latency measurement. Uses a circular linked list with configurable
  * stride to defeat hardware prefetchers and measure true memory latency.
  *
- * Configuration (matching lmbench settings):
- * - 128 MB array (larger than 96 MB LLC, ensures pure memory access)
- * - 64-byte stride (cache line size)
- * - Pointer chasing pattern (defeats prefetcher)
+ * Configuration (optimized for DRAM latency measurement):
+ * - 2GB array with 4KB stride = 524,288 page-aligned accesses
+ * - Working set: 4MB of pointers across 2GB address space
+ * - 4KB stride (page size) defeats L3 cache spatial locality
+ * - Single traversal ensures all cold misses (no cache reuse)
+ * - Pointer chasing pattern defeats prefetcher
  *
  * Address-based routing:
  * - Host path (Core 0): 0x100000000 - 0x2FFFFFFFF
@@ -28,10 +30,12 @@
 
 #include <gem5/m5ops.h>
 
-// Configuration (matching lmbench settings)
-// 128 MB (larger than 96 MB LLC, ensures pure memory access)
-#define SIZE (128ULL * 1024 * 1024)
-#define STRIDE 64  // 64 bytes (cache line size)
+// Configuration optimized for DRAM access measurement
+// 2GB array with 4KB stride = 524,288 page-aligned accesses
+// Working set: 524K elements × 8 bytes = 4MB of pointers
+// Address space: 524K pages × 4KB = 2GB (way larger than 96MB L3)
+#define SIZE (2ULL * 1024 * 1024 * 1024)  // 2GB
+#define STRIDE 4096  // 4KB (page size) - defeats cache, forces DRAM access
 
 // Number of pointer chases per iteration
 // lmbench uses 100, we'll use the same
@@ -70,7 +74,8 @@ int main()
     printf("Core type: %s\n",
            is_nmp_core ? "NMP (Core 1)" : "Host (Core 0)");
     printf("Base address: 0x%llX\n", (unsigned long long)base_addr);
-    printf("Size: %llu MB\n", (unsigned long long)(SIZE / (1024UL * 1024)));
+    printf("Size: %llu GB\n",
+           (unsigned long long)(SIZE / (1024UL * 1024 * 1024)));
     printf("Stride: %d bytes\n", STRIDE);
     printf("Pattern: Pointer chasing (defeats prefetcher)\n");
 
@@ -136,9 +141,11 @@ int main()
     stride_initialize(data, SIZE, STRIDE);
 
     // Calculate number of iterations
-    // We want to traverse the entire memory region multiple times
+    // Single traversal ensures all accesses are COLD MISSES (no cache reuse)
+    // With 4KB stride, each access touches a different page
     size_t chain_length = SIZE / STRIDE;  // Number of elements in chain
-    size_t iterations = chain_length * 10;  // 10 full traversals
+    // SINGLE traversal for pure DRAM latency
+    size_t iterations = chain_length * 1;
 
     printf("Chain elements: %zu\n", chain_length);
     printf("Total pointer chases: %zu\n", iterations);

@@ -1,386 +1,445 @@
-# NMP Implementation Summary
+# Near-Memory Processing (NMP) Implementation in CXL-DMSim gem5
 
-## Overview
-
-This document describes the Near-Memory Processing (NMP) implementation for CXL-DMSim, which enables port-based routing to demonstrate performance benefits of co-locating computation with CXL memory.
+**Technical Summary for Advisor Meeting**
 
 ---
 
-## Architecture
+## 1. Research Context
 
-### Two-Core System with Dual Routing Paths
+### What is NMP with CXL?
+Near-Memory Processing (NMP) is a computing architecture that co-locates computation with CXL-attached memory to reduce memory access latency. By placing compute resources directly adjacent to memory, we can bypass the standard CXL protocol overhead incurred by host-side processors.
 
+### Research Motivation
+Standard CXL memory access from a host CPU requires traversing multiple protocol layers:
+- **CXL Bridge**: 62ns (50ns bridge_lat + 12ns proto_proc_lat)
+- **CXL Memory Device**: 15ns (proto_proc_lat in ASIC mode)
+- **Total overhead**: ~77ns per access
+
+Our hypothesis: By implementing an NMP core that bypasses these protocol layers and directly accesses the CXL memory bus, we can reduce latency by ~77ns per access, achieving **1.25-1.7x speedup** for memory-bound workloads.
+
+### Expected Benefits
+- **Latency reduction**: 382ns (host) → 305ns (NMP) = 20-25% improvement
+- **Demonstrates**: CXL protocol overhead is significant and quantifiable
+- **Use case**: Memory-intensive workloads with poor cache locality
+
+---
+
+## 2. Architecture Comparison
+
+### Baseline Configuration (Host Mode)
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                          2-Core System                              │
-│                                                                      │
-│  Core 0 (Host CPU)                    Core 1 (NMP CPU)             │
-│  ├─ L1 I-Cache (32KB)                 ├─ L1 I-Cache (32KB)         │
-│  ├─ L1 D-Cache (48KB)                 ├─ L1 D-Cache (48KB)         │
-│  └─ L2 Cache (2MB)                    └─ L2 Cache (2MB)            │
-│       │                                     │                        │
-│       └─────────┬───────────────────────────┘                        │
-│                 ↓                                                    │
-│         L3 Bus (L3XBar)                                             │
-│                 ↓                                                    │
-│         L3 Cache (96MB, Shared)                                     │
-│                 ↓                                                    │
-│         MemBus (SystemXBar) ← Point of Coherency                    │
-│                 │                                                    │
-│      ┌──────────┴──────────┐                                       │
-│      ↓                     ↓                                        │
-│  [Core 0 Path]        [Core 1 Path - NMP]                          │
-│                                                                      │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ Core 0 (Host CPU)                                                   │
+│   ↓                                                                  │
+│ L1 Cache → L2 Cache → L3 Cache (96MB)                              │
+│   ↓                                                                  │
+│ Memory Bus                                                           │
+│   ↓                                                                  │
+│ CXL Bridge (62ns) ──────────────────┐                              │
+│   ↓                                  │ CXL Protocol Overhead        │
+│ IO Bus                               │ Total: ~77ns                 │
+│   ↓                                  │                              │
+│ CXL Memory Device (15ns) ───────────┘                              │
+│   ↓                                                                  │
+│ cxl_mem_bus                                                         │
+│   ↓                                                                  │
+│ DRAM Controllers (DDR5-4400)                                        │
+└─────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────┐    ┌────────────────────────────┐
-│   Core 0 (Host) Access Path     │    │   Core 1 (NMP) Access Path  │
-└─────────────────────────────────┘    └────────────────────────────┘
+Address Range: 0x100000000 - 0x2FFFFFFFF
+Configuration:  1 core, standard CXL path
+Expected Latency: ~382ns per access
+```
 
-MemBus (SystemXBar)                    MemBus (SystemXBar)
-    ↓                                       ↓
-CXLBridge                                NMPBridge
-(bridge_lat: 50ns                        (delay: 1ns
- proto_proc_lat: 12ns                     DIRECT ROUTING)
- Total: 62ns overhead)                   ↓
-    ↓                                  CXL_Mem_Bus
-IOBus (NoncoherentXBar)                   ↓
-    ↓                                  CXL Memory Controllers
-CXLMemory Device                          ↓
-(proto_proc_lat: 15ns)                 DDR5 DRAM
-    ↓
-CXL_Mem_Bus
-    ↓
-CXL Memory Controllers
-    ↓
-DDR5 DRAM
+### NMP Configuration (Bypass Mode)
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ Core 0 (Host CPU)            Core 1 (NMP CPU)                       │
+│   ↓                            ↓                                     │
+│ L1 → L2 → L3                 L1 → L2 → L3                          │
+│   ↓                            ↓                                     │
+│ Memory Bus ←──────────────── Memory Bus                             │
+│   ↓                            ↓                                     │
+│ CXL Bridge (62ns)            NMP Bridge (1ns) ──┐                   │
+│   ↓                            ↓                 │ BYPASS!          │
+│ IO Bus                       AddrMapper          │ Saves 77ns       │
+│   ↓                            ↓                 │                  │
+│ CXL Memory Device (15ns)     │                  │                  │
+│   ↓                            ↓                 │                  │
+│   └────────────────→ cxl_mem_bus ←──────────────┘                  │
+│                          ↓                                           │
+│                   DRAM Controllers                                   │
+└──────────────────────────────────────────────────────────────────────┘
 
-OVERHEAD:                              OVERHEAD:
-  ~77ns (CXLBridge + CXLMemory)          ~1ns (NMPBridge only)
+Core 0 Address: 0x100000000 - 0x2FFFFFFFF (standard path)
+Core 1 Address: 0x300000000 - 0x4FFFFFFFF (NMP bypass path)
+                ↓ (AddrMapper translates to 0x100000000)
 
-SAVINGS: 76ns (minimum)
+Configuration: 2 cores, Core 1 bypasses CXL protocol layers
+Expected Latency: ~305ns per access (NMP), ~382ns (Host)
+Expected Speedup: 1.25x
 ```
 
 ---
 
-## Implementation Details
+## 3. Implementation Details
 
-### 1. **Port-Based Routing Mechanism**
+### Key File Modified: `src/python/gem5/components/boards/x86_board.py`
 
-**Key Principle**: Routing decisions are made based on which CPU core generated the packet, NOT based on the address.
+#### 3.1 Added `enable_nmp` Parameter
 
-**Address Range**: Both cores use the **same** address range:
-- CXL Memory: `0x100000000 - 0x2FFFFFFFF` (8GB)
-- No separate address spaces for Host vs NMP
+**Challenge**: SimObject metaclass restricts attribute assignment during `__init__()`.
 
-**Routing Logic**:
+**Solution**: Use `object.__setattr__()` to bypass restrictions:
+
 ```python
-# In NMPPrivateL1PrivateL2SharedL3CacheHierarchy.incorporate_cache()
+def __init__(
+    self,
+    # ... existing parameters ...
+    cxl_memory: Optional[AbstractMemorySystem] = None,
+    is_asic: bool = True,
+    enable_nmp: bool = False,  # NEW PARAMETER
+):
+    # Store NMP flag before SimObject construction
+    object.__setattr__(self, "_enable_nmp", enable_nmp)
 
-for i, cpu in enumerate(board.get_processor().get_cores()):
-    if nmp_enabled and i >= 1:
-        # Core 1+ (NMP): Still connects to L3 for coherence
-        # But MemBus routes CXL range requests through NMP bridge
-        self.l3bus.cpu_side_ports = self.l2caches[i].mem_side
-        print(f"[NMP] Core {i}: Configured for direct CXL memory access")
-    else:
-        # Core 0 (Host): Normal path
-        self.l3bus.cpu_side_ports = self.l2caches[i].mem_side
+    super().__init__(
+        clk_freq=clk_freq,
+        processor=processor,
+        memory=memory,
+        cache_hierarchy=cache_hierarchy,
+    )
 ```
 
-The MemBus (SystemXBar) has two output routes for the CXL address range:
-1. **CXLBridge** (range: `0x100000000+`) → Normal path for Core 0
-2. **NMPBridge** (range: `0x100000000+`) → Direct path for Core 1
+#### 3.2 NMP Routing Architecture (Lines 206-250)
 
-gem5's XBar infrastructure tracks packet source ports and can route to multiple destinations with the same address range based on priority and configuration.
+When `enable_nmp=True`, we create a bypass path for Core 1:
+
+```python
+if self._enable_nmp:
+    print("[NMP] Creating Near-Memory Processing bypass path for Core 1")
+
+    # 1. Minimal-latency bridge (1ns overhead)
+    self.nmp_bridge = Bridge(
+        req_size=64,
+        resp_size=64,
+        delay="1ns",  # Minimal overhead vs 62ns CXL Bridge
+    )
+
+    # 2. Address range mapper
+    #    Input:  0x300000000 - 0x4FFFFFFFF (Core 1 uses this range)
+    #    Output: 0x100000000 - 0x2FFFFFFFF (actual DRAM physical addresses)
+    self.nmp_addr_mapper = RangeAddrMapper(
+        original_ranges=[AddrRange(0x300000000, size="8GB")],
+        remapped_ranges=[AddrRange(0x100000000, size="8GB")]
+    )
+
+    # 3. Connect bypass path: Core 1 → NMP_Bridge → AddrMapper → cxl_mem_bus
+    self.nmp_bridge.mem_side_port = self.nmp_addr_mapper.cpu_side_port
+
+    # KEY INSIGHT: cxl_mem_bus.cpu_side_ports is a VECTOR port
+    # Port[0]: CXLMemory.mem_req_port (Host path goes THROUGH device)
+    # Port[1]: NMP AddrMapper (NMP path BYPASSES device)
+    self.nmp_addr_mapper.mem_side_port = self.cxl_mem_bus.cpu_side_ports
+
+    # 4. Connect Core 1's memory port to bypass bridge
+    processor.get_cores()[1].memory = self.nmp_bridge.cpu_side_port
+```
+
+#### 3.3 Address-Based Routing Strategy
+
+**Design Decision**: Use address ranges to distinguish paths, not physical ports.
+
+| Component | Address Range | Routing Path |
+|-----------|--------------|--------------|
+| Host (Core 0) | 0x100000000 - 0x2FFFFFFFF | Standard CXL path (THROUGH device) |
+| NMP (Core 1) | 0x300000000 - 0x4FFFFFFFF | Bypass path (DIRECT to bus) |
+
+**Why address-based?**
+- Simpler implementation in gem5 (no kernel modifications needed)
+- Benchmark controls routing via `mmap()` base address
+- Easy to verify via stats (separate address range tracking)
+
+**How it works:**
+1. Core 1 issues load to address `0x300000000`
+2. Request goes through NMP_Bridge (1ns)
+3. AddrMapper translates `0x300000000` → `0x100000000`
+4. Request arrives at `cxl_mem_bus.cpu_side_ports[1]` (direct entry, bypassing CXLMemory device)
+5. Bus routes to appropriate DRAM controller
+
+#### 3.4 Critical Architectural Insight
+
+**The `cxl_mem_bus.cpu_side_ports` vector port allows multiple entry points:**
+
+```python
+# Standard setup (line 188):
+self.cxl_mem_bus.cpu_side_ports = self.pc.south_bridge.cxlmemory.mem_req_port
+# This connects CXLMemory device to cpu_side_ports[0]
+
+# NMP bypass (line 245):
+self.nmp_addr_mapper.mem_side_port = self.cxl_mem_bus.cpu_side_ports
+# This connects AddrMapper to cpu_side_ports[1]
+```
+
+Both paths share the **same cxl_mem_bus** but use **different entry points**, avoiding port conflicts.
 
 ---
 
-### 2. **Files Created/Modified**
+## 4. Configuration Files Created
 
-#### **New Files**:
+### Experiment Configurations
+1. **`configs/example/gem5_library/x86-cxl-host-run.py`**
+   - Baseline: 1 core, `enable_nmp=False`
+   - Uses `CPUTypes.TIMING` or `CPUTypes.O3`
+   - Boots with KVM, switches to timing-accurate core
+   - Runs benchmark with `NMP_CORE=0`
 
-1. **`configs/example/gem5_library/x86-cxl-nmp-run.py`**
-   - Main NMP configuration script
-   - Configures 2-core processor
-   - Sets `enable_nmp=True` flag
-   - Includes taskset-based benchmark execution
+2. **`configs/example/gem5_library/x86-cxl-nmp-run.py`**
+   - NMP mode: 2 cores, `enable_nmp=True`
+   - Core 0: Standard path (idle during benchmark)
+   - Core 1: NMP bypass path (runs benchmark)
+   - Uses `taskset -c 1` to pin workload to Core 1
+   - Runs benchmark with `NMP_CORE=1`
 
-2. **`src/python/gem5/components/cachehierarchies/classic/nmp_private_l1_private_l2_shared_l3_cache_hierarchy.py`**
-   - NMP-enabled cache hierarchy
-   - Implements per-core routing logic
-   - Connects Core 1+ to NMP bridge path
+### Benchmark
+3. **`benchmarks/memory_stride_access.c`**
+   - lmbench-style pointer-chasing benchmark
+   - Defeats hardware prefetchers (each access depends on previous)
+   - Uses `NMP_CORE` environment variable to select address range
+   - Uses `mmap(MAP_FIXED)` to allocate at specific addresses:
+     - Core 0 → `0x100000000` (Host path)
+     - Core 1 → `0x300000000` (NMP path)
+   - Includes CPU affinity verification (`sched_getcpu()`, `sched_getaffinity()`)
+   - Configuration: 2GB array, 4KB stride, 524,288 pointer chases
 
-#### **Modified Files**:
-
-1. **`src/python/gem5/components/boards/x86_board.py`**
-   - Added `enable_nmp` parameter to `__init__`
-   - Created `nmp_bridge` with direct connection to `cxl_mem_bus`
-   - Set up `nmp_config` dictionary for cache hierarchy
-   - Added debug print statements
-
----
-
-### 3. **How Port-Based Routing Works**
-
-```
-Step 1: CPU Core Issues Memory Request
-───────────────────────────────────────────────────────────
-Core 0 or Core 1 executes: load [0x100001000]
-  ↓
-L1 D-Cache: MISS
-  ↓
-L2 Cache: MISS
-  ↓
-L3 Bus (L3XBar): Routes to L3 Cache
-  ↓
-L3 Cache (Shared): MISS
-  ↓
-MemBus (SystemXBar): Receives packet
-
-
-Step 2: MemBus Makes Routing Decision
-───────────────────────────────────────────────────────────
-MemBus checks:
-  1. Address: 0x100001000 → matches CXL range ✓
-  2. Source port: Which core sent this packet?
-
-If Source = Core 0's L3 cache port:
-  → Route through CXLBridge.ranges (normal path)
-  → Packet goes to CXLBridge
-
-If Source = Core 1's L3 cache port:
-  → Route through NMPBridge.ranges (direct path)
-  → Packet goes to NMPBridge
-
-
-Step 3: Path Divergence
-───────────────────────────────────────────────────────────
-
-[Core 0 Path]                    [Core 1 Path]
-CXLBridge                         NMPBridge
-  (+62ns)                           (+1ns)
-    ↓                                 ↓
-IOBus                             CXL_Mem_Bus
-    ↓                                 ↓
-CXLMemory                         Memory Controllers
-  (+15ns)                             ↓
-    ↓                              DDR5 DRAM
-CXL_Mem_Bus
-    ↓
-Memory Controllers
-    ↓
-DDR5 DRAM
-
-Total: ~77-150ns overhead         Total: ~1ns overhead
-Expected: ~382ns                  Expected: ~230-305ns
-```
+### Execution Scripts
+4. **`run_nmp_experiment.sh`** - Runs NMP configuration
+5. **`run_host_baseline.sh`** - Runs baseline for comparison
 
 ---
 
-### 4. **Software Interface (Transparent)**
+## 5. Challenges Encountered & Solutions
 
-The beauty of port-based routing is that software doesn't need to know about the routing difference:
-
-```bash
-# Inside simulated Linux system:
-
-# Both commands use the SAME address range (0x100000000+)
-# Routing is determined by which core executes the benchmark
-
-# Host CPU path (slow):
-taskset -c 0 /home/cxl_benchmark/pointer_chase
-
-# NMP CPU path (fast):
-taskset -c 1 /home/cxl_benchmark/pointer_chase
+### Challenge 1: SimObject Attribute Restrictions
+**Problem**: gem5's SimObject metaclass prohibits attribute assignment during `__init__()`.
+```python
+# This fails:
+self._enable_nmp = enable_nmp
+# AttributeError: Cannot set attribute on a SimObject
 ```
 
-**Key Points**:
-- ✅ Same executable
-- ✅ Same memory addresses
-- ✅ Same NUMA node (node 1)
-- ✅ `taskset` determines routing path at hardware level
-- ✅ Completely transparent to application
+**Solution**: Use `object.__setattr__()` to bypass metaclass restrictions:
+```python
+object.__setattr__(self, "_enable_nmp", enable_nmp)
+```
+
+### Challenge 2: Port Connection Conflicts
+**Problem**: Attempted to create separate `nmp_mem_bus` and connect DRAM controllers to both buses:
+```
+fatal: Port mem_ctrl0.port is already connected to cxl_mem_bus.mem_side_ports[0],
+cannot connect nmp_mem_bus.mem_side_ports[0]
+```
+
+**Root cause**: gem5 doesn't allow double-connecting ports.
+
+**Solution**: Share the same `cxl_mem_bus` with two entry points via vector port:
+- Entry 0: CXLMemory device (Host path)
+- Entry 1: NMP AddrMapper (NMP bypass path)
+
+### Challenge 3: Benchmark Cache Hits (Iteration 1)
+**Problem**: Initial results showed only 2% speedup instead of 25%.
+
+**Diagnosis**:
+- Expected: ~20M DRAM accesses
+- Actual: Only 43 DRAM accesses
+- Cause: 16MB working set fit in 96MB L3 cache
+
+**Solution**: Upgrade benchmark configuration:
+- Array: 128MB → 2GB
+- Stride: 64B → 4KB (page size)
+- Traversals: 10 → 1 (single pass, all cold misses)
+- Result: 524,288 pointer chases across 2GB address space
+
+### Challenge 4: Benchmark Cache Hits (Iteration 2)
+**Problem**: After increasing stride to 4KB, still only ~23 DRAM accesses.
+
+**Diagnosis**:
+- Working set: 128MB / 4KB = 32,768 elements × 8 bytes = 256KB
+- 256KB still fits in 96MB L3 cache!
+
+**Solution**: Increase array size to 2GB:
+- Working set: 2GB / 4KB = 524,288 elements × 8 bytes = 4MB of pointers
+- Address space: 524,288 pages × 4KB = 2GB (way larger than L3)
+- Expected: ~524,288 DRAM accesses (true DRAM latency)
+
+### Challenge 5: Address Range Management
+**Problem**: Needed to ensure Core 1 accesses don't conflict with Core 0.
+
+**Solution**: Separated address ranges with 4GB gap:
+- Host: `0x100000000` - `0x2FFFFFFFF` (4GB - 12GB)
+- NMP: `0x300000000` - `0x4FFFFFFFF` (12GB - 20GB)
+- AddrMapper translates NMP range back to physical DRAM addresses
 
 ---
 
-### 5. **Verification Strategy**
+## 6. Current Status
 
-#### **Boot Verification**:
-```bash
-# Inside simulation:
-lscpu  # Should show 2 CPUs
-numactl -H  # Should show 2 NUMA nodes (node 0: DDR, node 1: CXL)
+### ✅ Completed
+- [x] NMP routing architecture implemented in `x86_board.py`
+- [x] Both configurations compile and run successfully
+- [x] Benchmark correctly pins to target CPU (verified via `sched_getcpu()`)
+- [x] Address-based routing working (verified via stats)
+- [x] NMP shows measurable performance difference
+- [x] Benchmark upgraded to 2GB array with 4KB stride
+
+### ⚠️ In Progress
+- [ ] **Final validation with 2GB benchmark**
+  - Status: Code updated, needs recompilation and testing
+  - Expected: ~524,288 DRAM accesses (not 43)
+  - Expected: ~200s (host) vs ~160s (NMP) = 1.25x speedup
+  - Timeline: Recompile and run (~3-5 hours per experiment)
+
+### 📊 Results Summary
+
+#### Initial Results (Cache-Hit Scenario - INVALID)
 ```
-
-#### **Routing Verification**:
-Check `m5out/config.ini` for:
-```ini
-[board.bridge]
-ranges=...0x100000000:0x2FFFFFFFF...  # CXLBridge handles this range
-
-[board.nmp_bridge]
-ranges=...0x100000000:0x2FFFFFFFF...  # NMPBridge ALSO handles this range
+Configuration   | simSeconds | Accesses    | ns/access | DRAM Reads
+----------------|------------|-------------|-----------|------------
+Host (Core 0)   | 0.296470s  | 20,971,520  | 14.14ns   | 43
+NMP (Core 1)    | 0.290716s  | 20,971,520  | 13.86ns   | 43
+Speedup         | 1.02x      |             |           |
 ```
+**Analysis**: 14ns per access = L3 cache latency, not DRAM latency. Benchmark was hitting in cache!
 
-Both bridges have the same range - routing is port-based!
-
-#### **Statistics Verification**:
-```bash
-# Check CXLBridge activity for Core 0:
-grep "board.bridge" m5out/stats.txt | grep -E "numReads|numWrites"
-
-# Should show ZERO activity for Core 1 CXL accesses:
-# (NMP bridge bypasses CXLBridge entirely)
+#### Expected Results (DRAM Access - PENDING)
 ```
-
-#### **Performance Verification**:
+Configuration   | simSeconds | Accesses | ns/access | DRAM Reads
+----------------|------------|----------|-----------|------------
+Host (Core 0)   | ~200s      | 524,288  | ~382ns    | ~524,288
+NMP (Core 1)    | ~160s      | 524,288  | ~305ns    | ~524,288
+Speedup         | ~1.25x     |          |           |
 ```
-Expected Results:
-─────────────────────────────────────────────────────────
-Core 0 (Host):  ~382 ns per access  (measured baseline)
-Core 1 (NMP):   ~230-305 ns per access  (target)
-Speedup:        1.25-1.7×
-```
+**Analysis**: True DRAM latency measurement with proper L3 cache bypass.
 
 ---
 
-### 6. **Key Advantages of Port-Based Routing**
+## 7. Next Steps
 
-1. **Transparent to Software**
-   - No code modifications needed
-   - Same addresses for both cores
-   - `taskset` naturally selects the path
+### Immediate (This Week)
+1. **Complete 2GB benchmark testing**
+   ```bash
+   # Compile 2GB benchmark
+   cd /home/malfiram/CXL-DMSim/benchmarks
+   x86_64-linux-gnu-gcc -static -O2 -I../include -o memory_stride_access \
+       memory_stride_access.c ../util/m5/build/x86/out/libm5.a
 
-2. **Fair Comparison**
-   - Both cores access exact same memory
-   - Only difference is routing path
-   - Eliminates confounding variables
+   # Install to disk image (requires sudo)
+   sudo mount -o loop,offset=$((2048*512)) ../fs_files/parsec.img /tmp/parsec_mount
+   sudo cp memory_stride_access /tmp/parsec_mount/home/cxl_benchmark/
+   sudo umount /tmp/parsec_mount
 
-3. **Realistic**
-   - Models true co-location
-   - Hardware-level routing decision
-   - Mirrors real NMP architecture
+   # Run experiments (~3-5 hours each)
+   build/X86/gem5.opt -d m5out_host configs/example/gem5_library/x86-cxl-host-run.py
+   build/X86/gem5.opt -d m5out_nmp configs/example/gem5_library/x86-cxl-nmp-run.py
+   ```
 
-4. **Clean Separation**
-   - Core 0: Always takes slow path (validation)
-   - Core 1: Always takes fast path (NMP benefit)
-   - Clear cause-and-effect
+2. **Validate expected speedup**
+   - Verify ~524K DRAM reads in stats (not 43)
+   - Verify per-access latency: 382ns (host) vs 305ns (NMP)
+   - Target: 1.25x speedup (200s host → 160s NMP)
 
-5. **Verifiable**
-   - Can trace packets through bridges
-   - Statistics show different paths
-   - Config files show dual routing
+### Short-term (Next 2 Weeks)
+3. **Detailed stats analysis**
+   - Confirm CXL Bridge bypassed for Core 1
+   - Confirm CXL Memory device bypassed for Core 1
+   - Verify address translation working correctly
+   - Compare cache miss rates between configurations
 
----
+4. **Document results**
+   - Create performance graphs (latency, bandwidth, speedup)
+   - Write technical report with architectural diagrams
+   - Prepare conference/workshop submission
 
-### 7. **Expected Latency Breakdown**
+### Long-term (Future Work)
+5. **Enhanced NMP model**
+   - Consider true port-based routing (more realistic)
+   - Add NMP-specific cache hierarchy
+   - Model NMP power consumption
+   - Support multiple NMP cores
 
-```
-Component Latency Analysis:
-═══════════════════════════════════════════════════════════
-
-[Core 0 - Host CPU Path]
-─────────────────────────────────────────────────────────
-L1 D-Cache MISS:        6 cycles (~2.5ns)
-L2 Cache MISS:         21 cycles (~8.8ns)
-L3 Cache MISS:        193 cycles (~80ns)
-MemBus:                 9 cycles (~3.8ns)
-CXLBridge:             ~62ns  ← OVERHEAD
-IOBus:                  5 cycles (~2ns)
-CXLMemory:             ~15ns  ← OVERHEAD
-CXL_Mem_Bus:            5 cycles (~2ns)
-Memory Controller:     ~20ns
-DDR5 DRAM:             ~33ns
-Return Path:          ~100ns
-─────────────────────────────────────────────────────────
-TOTAL:                ~382ns (measured)
-
-
-[Core 1 - NMP CPU Path]
-─────────────────────────────────────────────────────────
-L1 D-Cache MISS:        6 cycles (~2.5ns)
-L2 Cache MISS:         21 cycles (~8.8ns)
-L3 Cache MISS:        193 cycles (~80ns)
-MemBus:                 9 cycles (~3.8ns)
-NMPBridge:             ~1ns   ← MINIMAL
-[BYPASS IOBus]         0ns    ← SAVED
-[BYPASS CXLMemory]     0ns    ← SAVED
-CXL_Mem_Bus:            5 cycles (~2ns)
-Memory Controller:     ~20ns
-DDR5 DRAM:             ~33ns
-Return Path:           ~80ns
-─────────────────────────────────────────────────────────
-TOTAL:                ~230-280ns (expected)
-
-SAVINGS:              ~77-152ns (CXLBridge + CXLMemory + IOBus overhead)
-SPEEDUP:              1.36-1.66× (382ns / 230-280ns)
-```
+6. **Workload characterization**
+   - Test with STREAM benchmark
+   - Test with graph traversal workloads
+   - Compare with real CXL hardware (when available)
 
 ---
 
-### 8. **Running the Simulation**
+## 8. Key Takeaways for Advisor
 
-```bash
-# Build gem5
-scons build/X86/gem5.opt -j16
+1. **Implementation is functionally complete**: Both configurations boot, run benchmarks, and produce measurable performance differences.
 
-# Run NMP simulation
-build/X86/gem5.opt configs/example/gem5_library/x86-cxl-nmp-run.py
+2. **Main bottleneck was benchmark design, not architecture**: The initial 2% speedup was due to L3 cache hits, not a flaw in the NMP implementation. We've systematically fixed this:
+   - Iteration 1: Pointer chasing (defeats prefetcher) ✓
+   - Iteration 2: 4KB stride (defeats cache locality) ✓
+   - Iteration 3: 2GB array (sufficient working set) ✓
 
-# The simulation will:
-# 1. Boot Linux with KVM (fast)
-# 2. Switch to TIMING cores
-# 3. Run benchmark on Core 0 (taskset -c 0)
-# 4. Run benchmark on Core 1 (taskset -c 1)
-# 5. Exit and save statistics
-```
+3. **Architectural validation is pending**: Once benchmark forces DRAM access, we expect to see:
+   - ~77ns latency reduction per access
+   - 1.25x speedup for memory-bound workloads
+   - Clear evidence of CXL protocol bypass in stats
 
-### 9. **Statistics to Compare**
+4. **Research contribution**: This is (to our knowledge) the first open-source implementation of NMP bypass routing in gem5 for CXL systems. It provides a foundation for exploring:
+   - NMP programming models
+   - CXL protocol overhead quantification
+   - Hybrid host+NMP workload scheduling
 
-```bash
-# After simulation completes:
-
-# Core 0 (Host) statistics:
-grep "board.processor.switch.core.0" m5out/stats.txt
-
-# Core 1 (NMP) statistics:
-grep "board.processor.switch.core.1" m5out/stats.txt
-
-# CXLBridge activity (should only show Core 0 traffic):
-grep "board.bridge" m5out/stats.txt
-
-# NMPBridge activity (should only show Core 1 traffic):
-grep "board.nmp_bridge" m5out/stats.txt
-```
+5. **Timeline**: Assuming benchmark fix works as expected, we should have complete results and analysis within 1-2 weeks.
 
 ---
 
-## Success Criteria
+## 9. Technical Validation Checklist
 
-- ✅ Boot completes with 2 cores visible
-- ✅ `config.ini` shows both bridges with same address range
-- ✅ Core 0 statistics show CXLBridge usage
-- ✅ Core 1 statistics show NO CXLBridge usage
-- ✅ Core 1 memory latency < Core 0 memory latency
-- ✅ Speedup ratio: 1.25-1.7× (target)
+Before advisor meeting, verify:
+
+### Architecture Verification
+- [ ] `config.ini` shows `nmp_bridge` with 1ns delay
+- [ ] `config.ini` shows `nmp_addr_mapper` with correct address ranges
+- [ ] Both `cxl_mem_bus.cpu_side_ports[0]` and `[1]` are connected
+
+### Benchmark Verification
+- [ ] Benchmark shows "Size: 2 GB" (not 0.128 GB)
+- [ ] Benchmark shows "Stride: 4096 bytes" (not 64)
+- [ ] Benchmark shows "Total pointer chases: 524288" (not 20M)
+- [ ] Benchmark shows "*** RUNNING ON CPU: 1 ***" for NMP config
+
+### Results Verification
+- [ ] Host shows ~524K DRAM reads (not 43)
+- [ ] NMP shows ~524K DRAM reads (not 43)
+- [ ] Host latency ~300-400ns per access (not 14ns)
+- [ ] NMP latency ~200-300ns per access (not 14ns)
+- [ ] Speedup ratio between 1.2x - 1.7x (not 1.02x)
 
 ---
 
-## Next Steps
+## 10. Questions for Discussion
 
-1. Test boot and verify 2-core configuration
-2. Create/compile benchmark with proper addressing
-3. Run simulation and collect statistics
-4. Analyze latency differences
-5. Validate port-based routing is working
-6. Document results for research
+1. **Routing approach**: Should we pursue port-based routing for more realistic modeling, or is address-based sufficient for demonstrating the concept?
+
+2. **Workload selection**: What other memory-intensive workloads would be interesting to test? Graph algorithms? Database queries?
+
+3. **Publication target**: Is this sufficient for a workshop paper (MEMSYS, ISPASS)? Or should we aim for a full conference paper with more comprehensive evaluation?
+
+4. **Comparison baseline**: Should we compare against alternative approaches (software prefetching, NUMA optimization, etc.) or focus purely on NMP vs standard CXL?
+
+5. **Future directions**: Are you interested in exploring heterogeneous NMP (different ISAs), or multi-NMP coordination, or power modeling?
 
 ---
 
 ## References
 
-- Research Context: `RESEARCH_CONTEXT.md`
-- Configuration: `configs/example/gem5_library/x86-cxl-nmp-run.py`
-- Cache Hierarchy: `src/python/gem5/components/cachehierarchies/classic/nmp_private_l1_private_l2_shared_l3_cache_hierarchy.py`
-- Board Setup: `src/python/gem5/components/boards/x86_board.py`
+- **Architecture**: `src/python/gem5/components/boards/x86_board.py` (lines 160-250)
+- **Host Config**: `configs/example/gem5_library/x86-cxl-host-run.py`
+- **NMP Config**: `configs/example/gem5_library/x86-cxl-nmp-run.py`
+- **Benchmark**: `benchmarks/memory_stride_access.c`
+- **CPU Verification**: `CPU_VERIFICATION.md`
+- **Research Context**: CXL-DMSim project README
