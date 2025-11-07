@@ -106,6 +106,36 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             )
 
     @overrides(AbstractSystemBoard)
+    def _connect_things(self) -> None:
+        """Override to add NMP bypass connection after cache hierarchy is incorporated."""
+        # First, do the standard connection (memory, cache, processor)
+        super()._connect_things()
+
+        # Now that cache hierarchy is incorporated and membus exists, set up NMP bypass
+        if self.enable_nmp:
+            # Direct connection: membus → cxl_mem_bus (bypass CXLBridge + CXLMemory)
+            # cxl_mem_bus.cpu_side_ports is a VECTOR port - accepts multiple connections:
+            # - Connection 1: CXLMemory.mem_req_port (Host path through CXL device)
+            # - Connection 2: membus (NMP direct bypass path)
+            self.cxl_mem_bus.cpu_side_ports = (
+                self.get_cache_hierarchy().membus.mem_side_ports
+            )
+
+            print("=" * 80)
+            print(
+                "[NMP] Near-Memory Processing enabled - Direct membus bypass"
+            )
+            print(
+                f"[NMP]   Host path: membus → CXLBridge(62ns) → CXLMemory(15ns) → cxl_mem_bus → DRAM"
+            )
+            print(f"[NMP]   NMP path:  membus → cxl_mem_bus → DRAM (DIRECT!)")
+            print(f"[NMP]   Savings: ~77ns (bypasses CXLBridge + CXLMemory)")
+            print(
+                "[NMP]   Note: Both paths share same address space, routing via vector port"
+            )
+            print("=" * 80)
+
+    @overrides(AbstractSystemBoard)
     def _setup_board(self) -> None:
         self.pc = Pc()
 
@@ -176,7 +206,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 ),
                 AddrRange(pci_config_address_space_base, Addr.max),
             ]
-            self.bridge.ranges.append(cxl_mem_range)
+            # Only add CXL memory range to bridge if NMP is disabled
+            # When NMP is enabled, the direct membus connection handles CXL memory
+            if not self.enable_nmp:
+                self.bridge.ranges.append(cxl_mem_range)
             self.pc.south_bridge.cxlmemory.cxl_mem_range = cxl_mem_range
             cxl_dram.set_memory_range([cxl_mem_range])
             cxl_abstract_mems = []
@@ -199,87 +232,6 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 self.pc.south_bridge.cxlmemory.proto_proc_lat = Latency("60ns")
                 self.pc.south_bridge.cxlmemory.rsp_size = 36
                 self.pc.south_bridge.cxlmemory.req_size = 36
-
-            # NMP (Near-Memory Processing) Direct Path Setup
-            # When enable_nmp is True, create a secondary direct bridge for Core 1
-            # that bypasses the CXL Bridge and CXL Memory device overhead
-            if self.enable_nmp:
-                from m5.objects import RangeAddrMapper
-
-                # Use DIFFERENT address range for NMP path (address-based routing)
-                # Normal CXL: 0x100000000-0x2FFFFFFFF (8GB)
-                # NMP direct: 0x300000000-0x4FFFFFFFF (next 8GB)
-                nmp_mem_start = Addr(0x300000000)  # 12GB offset
-                nmp_mem_range = AddrRange(
-                    nmp_mem_start, size=cxl_dram.get_size()
-                )
-
-                # Create address mapper to translate NMP addresses to CXL memory addresses
-                # Maps 0x300000000 -> 0x100000000
-                self.nmp_addr_mapper = RangeAddrMapper()
-                self.nmp_addr_mapper.original_ranges = [nmp_mem_range]
-                self.nmp_addr_mapper.remapped_ranges = [cxl_mem_range]
-
-                # Create NMP direct bridge: L3 Cache → Address Mapper → CXL Memory Bus
-                # This bypasses: CXLBridge (62ns) + CXLMemory device (15ns) = ~77ns
-                self.nmp_bridge = Bridge(delay="1ns")  # Minimal crossbar delay
-
-                # Connect bridge: CPU side to cache hierarchy
-                self.nmp_bridge.cpu_side_port = (
-                    self.get_cache_hierarchy().get_mem_side_port()
-                )
-                self.nmp_bridge.ranges = [nmp_mem_range]
-
-                # Connect bridge mem side to address mapper
-                self.nmp_bridge.mem_side_port = (
-                    self.nmp_addr_mapper.cpu_side_port
-                )
-
-                # Connect address mapper directly to cxl_mem_bus (BYPASS CXLMemory!)
-                # Key: cxl_mem_bus.cpu_side_ports is a VECTOR port (can accept multiple connections)
-                # Connection 1 (line 188): CXLMemory.mem_req_port (Host path goes THROUGH device)
-                # Connection 2 (here): NMP AddrMapper (NMP path BYPASSES device)
-                # Both paths share the same bus to DRAM, but NMP enters directly!
-                self.nmp_addr_mapper.mem_side_port = (
-                    self.cxl_mem_bus.cpu_side_ports
-                )
-
-                # Store config using object.__setattr__() since it's just a dict, not a SimObject
-                object.__setattr__(
-                    self,
-                    "nmp_config",
-                    {
-                        "enabled": True,
-                        "host_range": cxl_mem_range,
-                        "nmp_range": nmp_mem_range,
-                    },
-                )
-
-                print("=" * 80)
-                print(
-                    "[NMP] Near-Memory Processing enabled - Address-based routing:"
-                )
-                print(
-                    f"[NMP]   Host path (Core 0):  0x{int(cxl_mem_start):X} - 0x{int(cxl_mem_start) + cxl_dram.get_size() - 1:X}"
-                )
-                print(
-                    f"[NMP]   NMP path (Core 1):   0x{int(nmp_mem_start):X} - 0x{int(nmp_mem_start) + cxl_dram.get_size() - 1:X}"
-                )
-                print(
-                    f"[NMP]   Core 0: L3 → MemBus → CXLBridge(62ns) → IOBus → CXLMemory(15ns) → cxl_mem_bus → DRAM"
-                )
-                print(
-                    f"[NMP]   Core 1: L3 → MemBus → NMP_Bridge(1ns) → AddrMapper → cxl_mem_bus → DRAM (DIRECT)"
-                )
-                print(
-                    f"[NMP]   Both paths share cxl_mem_bus, but NMP bypasses CXLMemory device!"
-                )
-                print(
-                    f"[NMP]   Bypass savings: CXLBridge(62ns) + CXLMemory(15ns) = 77ns!"
-                )
-                print("=" * 80)
-            else:
-                object.__setattr__(self, "nmp_config", {"enabled": False})
 
             self.apicbridge = Bridge(delay="50ns")
             self.apicbridge.cpu_side_port = self.get_io_bus().mem_side_ports
