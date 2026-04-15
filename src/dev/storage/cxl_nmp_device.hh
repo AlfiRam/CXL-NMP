@@ -66,17 +66,19 @@ class CXLNMPDevice : public PciDevice
     // Operation codes
     enum Opcode : uint64_t
     {
-        OP_MEMCPY = 0x0  // Simple memory copy (Phase 2)
-        // Future: OP_REDUCE, OP_SCAN, OP_FILTER, etc.
+        OP_MEMCPY = 0x0,     // Simple memory copy (Phase 2)
+        OP_PTR_CHASE = 0x1   // Pointer chasing (Phase 3A)
+        // Future: OP_SEARCH, OP_REDUCE, OP_SCAN, OP_FILTER, etc.
     };
 
-    // State machine for DMA operations (Phase 2)
+    // State machine for DMA operations
     enum OperationState : uint8_t
     {
         STATE_IDLE,        // No operation in progress
-        STATE_READING,     // Reading data from INPUT_ADDR
-        STATE_PROCESSING,  // Processing data (memcpy = no-op)
-        STATE_WRITING,     // Writing data to OUTPUT_ADDR
+        STATE_READING,     // Memcpy: bulk reading data from INPUT_ADDR
+        STATE_PROCESSING,  // Memcpy: processing data (memcpy = no-op)
+        STATE_WRITING,     // Memcpy: bulk writing data to OUTPUT_ADDR
+        STATE_CHASING,     // Pointer chase: iterative chase state (Phase 3A)
         STATE_ERROR        // Error occurred
     };
 
@@ -106,6 +108,12 @@ class CXLNMPDevice : public PciDevice
     std::deque<PacketPtr> pendingReadResponses;
     std::deque<PacketPtr> pendingWriteResponses;
     static const int maxOutstandingReqs = 1;  // Pipeline depth (conservative for now)
+
+    /** Phase 3A: Pointer chase state */
+    Addr currentChaseAddr;     // Current node address being read
+    Addr ptrOffset;            // Offset within node where pointer is stored
+    uint64_t hopsRemaining;    // Hops left to perform
+    uint64_t hopsCompleted;    // Hops completed so far
 
     /** Phase 2: Events */
     EventFunctionWrapper retryEvent;
@@ -152,6 +160,11 @@ class CXLNMPDevice : public PciDevice
     void handleWriteComplete(PacketPtr pkt); // Process write response
     void completeOperation();                // Mark operation as DONE
     void abortOperation(const char *reason); // Abort with error
+
+    /** Phase 3A: Pointer chase helpers */
+    void startPointerChase();                      // Begin pointer chase operation
+    void sendChaseRead();                          // Send read for current node
+    void handleChaseReadComplete(PacketPtr pkt);   // Extract pointer and continue
 
   public:
     PARAMS(CXLNMPDevice);

@@ -11,7 +11,7 @@ M5_INCLUDE = -I$(GEM5_INCLUDE)
 M5_LIB = $(M5_PATH)/build/x86/out/libm5.a
 
 # Targets
-TARGETS = memory_stride_access
+TARGETS = memory_stride_access nmp_device_test nmp_ptr_chase_test
 
 all: $(TARGETS)
 
@@ -24,17 +24,39 @@ memory_stride_access: memory_stride_access.c
 	$(CC) $(CFLAGS) $(M5_INCLUDE) -o $@ $< $(M5_LIB)
 	@echo "Built: $@ (with m5ops linked)"
 
+nmp_device_test: nmp_device_test.c
+	@if [ ! -f "$(M5_LIB)" ]; then \
+		echo "Building m5ops library..."; \
+		cd $(M5_PATH) && scons build/x86/out/libm5.a; \
+	fi
+	$(CC) $(CFLAGS) $(M5_INCLUDE) -o $@ $< $(M5_LIB)
+	@echo "Built: $@ (with m5ops linked)"
+
+nmp_ptr_chase_test: nmp_ptr_chase_test.c
+	@if [ ! -f "$(M5_LIB)" ]; then \
+		echo "Building m5ops library..."; \
+		cd $(M5_PATH) && scons build/x86/out/libm5.a; \
+	fi
+	$(CC) $(CFLAGS) $(M5_INCLUDE) -o $@ $< $(M5_LIB)
+	@echo "Built: $@ (with m5ops linked)"
+
 # Clean
 clean:
 	rm -f $(TARGETS) *.o
 
 # Install to disk image (requires mount)
-install: memory_stride_access
+install: $(TARGETS)
 	@if [ -d "/tmp/parsec_mount/home/cxl_benchmark" ]; then \
 		echo "Installing to disk image..."; \
 		sudo cp memory_stride_access /tmp/parsec_mount/home/cxl_benchmark/memory_stride_access; \
 		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/memory_stride_access; \
 		echo "Installed: /home/cxl_benchmark/memory_stride_access"; \
+		sudo cp nmp_device_test /tmp/parsec_mount/home/cxl_benchmark/nmp_device_test; \
+		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/nmp_device_test; \
+		echo "Installed: /home/cxl_benchmark/nmp_device_test"; \
+		sudo cp nmp_ptr_chase_test /tmp/parsec_mount/home/cxl_benchmark/nmp_ptr_chase_test; \
+		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/nmp_ptr_chase_test; \
+		echo "Installed: /home/cxl_benchmark/nmp_ptr_chase_test"; \
 	else \
 		echo "ERROR: Disk image not mounted at /tmp/parsec_mount"; \
 		echo "Run: sudo mount -o loop,offset=\$$((2048*512)) fs_files/parsec.img /tmp/parsec_mount"; \

@@ -258,12 +258,17 @@ CXLNMPDevice::write(PacketPtr pkt)
 bool
 CXLNMPDevice::NMPMemoryPort::recvTimingResp(PacketPtr pkt)
 {
-    // Phase 2: Handle memory read/write responses
+    // Handle memory read/write responses
     DPRINTF(CXLNMPDevice, "recvTimingResp: %s addr=0x%lx size=%d\n",
             pkt->cmdString(), pkt->getAddr(), pkt->getSize());
 
     if (pkt->isRead()) {
-        device.handleReadComplete(pkt);
+        // Route to appropriate handler based on current state
+        if (device.currentState == STATE_CHASING) {
+            device.handleChaseReadComplete(pkt);
+        } else {
+            device.handleReadComplete(pkt);
+        }
     } else if (pkt->isWrite()) {
         device.handleWriteComplete(pkt);
     } else {
@@ -300,39 +305,81 @@ CXLNMPDevice::startOperation()
     dataSize = registers[REG_DATA_SIZE / 8];
     opcode = registers[REG_OPCODE / 8];
 
-    // Validate parameters
-    if (inputAddr == 0 || outputAddr == 0 || dataSize == 0) {
-        abortOperation("Invalid operation parameters (zero address or size)");
+    // Validate common parameters
+    if (inputAddr == 0 || dataSize == 0) {
+        abortOperation("Invalid operation parameters (zero input address or size)");
         return;
     }
 
-    if (opcode != OP_MEMCPY) {
-        abortOperation("Unsupported opcode (only OP_MEMCPY=0 supported)");
+    // Route to operation-specific handler
+    if (opcode == OP_MEMCPY) {
+        // Phase 2: Memcpy operation
+        // For memcpy, outputAddr is required
+        if (outputAddr == 0) {
+            abortOperation("Memcpy: output address cannot be zero");
+            return;
+        }
+
+        // Allocate data buffer
+        dataBuffer = new uint8_t[dataSize];
+        if (!dataBuffer) {
+            abortOperation("Failed to allocate data buffer");
+            return;
+        }
+
+        // Reset transfer tracking
+        readBytesTransferred = 0;
+        writeBytesTransferred = 0;
+        nextReadAddr = inputAddr;
+        nextWriteAddr = outputAddr;
+
+        // Set status to BUSY
+        registers[REG_STATUS / 8] = STATUS_BUSY;
+
+        DPRINTF(CXLNMPDevice, "  Memcpy started: %lu bytes from 0x%lx to 0x%lx\n",
+                dataSize, inputAddr, outputAddr);
+
+        // Begin read phase
+        currentState = STATE_READING;
+        startReadPhase();
+
+    } else if (opcode == OP_PTR_CHASE) {
+        // Phase 3A: Pointer chase operation
+        // INPUT_ADDR = starting address
+        // DATA_SIZE = number of hops
+        // OUTPUT_ADDR = where to write final address (0 = don't write)
+        // RESERVED0 = pointer offset within each block
+        ptrOffset = registers[REG_RESERVED0 / 8];
+
+        // Validate parameters
+        if (dataSize == 0) {
+            abortOperation("Pointer chase: hop count cannot be zero");
+            return;
+        }
+        if (ptrOffset > 4096 - 8) {  // Pointer must fit in reasonable block
+            abortOperation("Pointer chase: pointer offset too large");
+            return;
+        }
+
+        // Initialize chase state
+        currentChaseAddr = inputAddr;
+        hopsRemaining = dataSize;  // DATA_SIZE = number of hops
+        hopsCompleted = 0;
+
+        // Set status to BUSY
+        registers[REG_STATUS / 8] = STATUS_BUSY;
+        currentState = STATE_CHASING;
+
+        DPRINTF(CXLNMPDevice, "  Pointer chase started: %lu hops from 0x%lx "
+                "(ptr offset %lu)\n",
+                hopsRemaining, currentChaseAddr, ptrOffset);
+
+        startPointerChase();
+
+    } else {
+        abortOperation("Unsupported opcode");
         return;
     }
-
-    // Allocate data buffer
-    dataBuffer = new uint8_t[dataSize];
-    if (!dataBuffer) {
-        abortOperation("Failed to allocate data buffer");
-        return;
-    }
-
-    // Reset transfer tracking
-    readBytesTransferred = 0;
-    writeBytesTransferred = 0;
-    nextReadAddr = inputAddr;
-    nextWriteAddr = outputAddr;
-
-    // Set status to BUSY
-    registers[REG_STATUS / 8] = STATUS_BUSY;
-
-    DPRINTF(CXLNMPDevice, "  Operation started: %lu bytes from 0x%lx to 0x%lx\n",
-            dataSize, inputAddr, outputAddr);
-
-    // Begin read phase
-    currentState = STATE_READING;
-    startReadPhase();
 }
 
 void
@@ -515,9 +562,9 @@ CXLNMPDevice::handleWriteComplete(PacketPtr pkt)
         return;
     }
 
-    // Verify we're in the correct state
-    if (currentState != STATE_WRITING) {
-        panic("CXLNMPDevice: Received write response in state %d (expected WRITING)",
+    // Verify we're in a valid state for write completion
+    if (currentState != STATE_WRITING && currentState != STATE_CHASING) {
+        panic("CXLNMPDevice: Received write response in state %d (expected WRITING or CHASING)",
               currentState);
     }
 
@@ -531,17 +578,25 @@ CXLNMPDevice::handleWriteComplete(PacketPtr pkt)
     // Free the packet
     delete pkt;
 
-    // Send next write chunk to maintain pipeline (if more data to write)
-    // Note: writeBytesTransferred was already incremented in sendNextWriteChunk()
-    if (writeBytesTransferred < dataSize) {
-        sendNextWriteChunk();
-    }
-
-    // Check if all writes are complete (all sent AND all received)
-    if (writeBytesTransferred >= dataSize && pendingWriteResponses.empty()) {
-        DPRINTF(CXLNMPDevice, "  Write phase complete (%lu bytes), operation DONE\n",
-                writeBytesTransferred);
+    // Handle based on operation type
+    if (currentState == STATE_CHASING) {
+        // Pointer chase: single write of final address - we're done
+        DPRINTF(CXLNMPDevice, "  Final address write complete, operation DONE\n");
         completeOperation();
+    } else {
+        // Memcpy: bulk write phase - continue pipeline
+        // Send next write chunk to maintain pipeline (if more data to write)
+        // Note: writeBytesTransferred was already incremented in sendNextWriteChunk()
+        if (writeBytesTransferred < dataSize) {
+            sendNextWriteChunk();
+        }
+
+        // Check if all writes are complete (all sent AND all received)
+        if (writeBytesTransferred >= dataSize && pendingWriteResponses.empty()) {
+            DPRINTF(CXLNMPDevice, "  Write phase complete (%lu bytes), operation DONE\n",
+                    writeBytesTransferred);
+            completeOperation();
+        }
     }
 }
 
@@ -590,6 +645,113 @@ CXLNMPDevice::abortOperation(const char *reason)
     currentState = STATE_ERROR;
 
     DPRINTF(CXLNMPDevice, "  Device in ERROR state\n");
+}
+
+// ===== Phase 3A: Pointer Chase Implementation =====
+
+void
+CXLNMPDevice::startPointerChase()
+{
+    DPRINTF(CXLNMPDevice, "startPointerChase: Reading node at 0x%lx "
+            "(hop %lu/%lu)\n",
+            currentChaseAddr, hopsCompleted + 1,
+            hopsCompleted + hopsRemaining);
+
+    sendChaseRead();
+}
+
+void
+CXLNMPDevice::sendChaseRead()
+{
+    // Read one cache line (64 bytes) containing the pointer
+    const Addr chunkSize = 64;
+
+    DPRINTF(CXLNMPDevice, "  sendChaseRead: addr=0x%lx size=%lu\n",
+            currentChaseAddr, chunkSize);
+
+    // Create read request for current node
+    RequestPtr req = std::make_shared<Request>(
+        currentChaseAddr, chunkSize, 0, Request::funcRequestorId);
+
+    PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+    pkt->allocate();
+
+    // Send through mem_port (direct to cxl_mem_bus)
+    if (!memPort.sendTimingReq(pkt)) {
+        panic("CXLNMPDevice: sendTimingReq failed in pointer chase");
+    }
+
+    // Track this request
+    pendingReadResponses.push_back(pkt);
+}
+
+void
+CXLNMPDevice::handleChaseReadComplete(PacketPtr pkt)
+{
+    DPRINTF(CXLNMPDevice, "handleChaseReadComplete: addr=0x%lx size=%d\n",
+            pkt->getAddr(), pkt->getSize());
+
+    // Check if operation was aborted
+    if (currentState == STATE_ERROR) {
+        DPRINTF(CXLNMPDevice, "  Operation aborted - discarding in-flight "
+                "chase read response\n");
+        delete pkt;
+        return;
+    }
+
+    // Extract pointer at specified offset
+    const uint8_t* data = pkt->getConstPtr<uint8_t>();
+    uint64_t nextPtr;
+    std::memcpy(&nextPtr, data + ptrOffset, sizeof(uint64_t));
+
+    DPRINTF(CXLNMPDevice, "  Extracted pointer: 0x%lx (offset %lu in block)\n",
+            nextPtr, ptrOffset);
+
+    // Remove from pending queue
+    auto it = std::find(pendingReadResponses.begin(),
+                        pendingReadResponses.end(), pkt);
+    if (it != pendingReadResponses.end()) {
+        pendingReadResponses.erase(it);
+    }
+    delete pkt;
+
+    // Update state
+    hopsCompleted++;
+    hopsRemaining--;
+    currentChaseAddr = nextPtr;
+
+    // Check if we're done
+    if (hopsRemaining == 0) {
+        DPRINTF(CXLNMPDevice, "  Pointer chase complete: %lu hops, "
+                "final address 0x%lx\n",
+                hopsCompleted, currentChaseAddr);
+
+        // Optionally write final address to OUTPUT_ADDR
+        if (outputAddr != 0) {
+            DPRINTF(CXLNMPDevice, "  Writing final address to 0x%lx\n",
+                    outputAddr);
+
+            // Create write request
+            RequestPtr req = std::make_shared<Request>(
+                outputAddr, sizeof(uint64_t), 0, Request::funcRequestorId);
+            PacketPtr wpkt = new Packet(req, MemCmd::WriteReq);
+            wpkt->allocate();
+            std::memcpy(wpkt->getPtr<uint8_t>(), &currentChaseAddr,
+                        sizeof(uint64_t));
+
+            if (!memPort.sendTimingReq(wpkt)) {
+                panic("CXLNMPDevice: sendTimingReq failed writing result");
+            }
+            pendingWriteResponses.push_back(wpkt);
+            // Will call completeOperation() in handleWriteComplete()
+        } else {
+            // No result write needed
+            completeOperation();
+        }
+    } else {
+        // Continue chasing
+        sendChaseRead();
+    }
 }
 
 } // namespace gem5
