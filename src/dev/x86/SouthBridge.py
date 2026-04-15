@@ -25,6 +25,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from m5.objects.Cmos import Cmos
+from m5.objects.CXLMemory import CXLMemory
+from m5.objects.CXLNMPDevice import CXLNMPDevice
 from m5.objects.I8042 import I8042
 from m5.objects.I8237 import I8237
 from m5.objects.I8254 import I8254
@@ -39,7 +41,6 @@ from m5.objects.X86Ide import X86IdeController
 from m5.params import *
 from m5.proxy import *
 from m5.SimObject import SimObject
-from m5.objects.CXLMemory import CXLMemory
 
 
 def x86IOAddress(port):
@@ -81,6 +82,8 @@ class SouthBridge(SimObject):
     ide = X86IdeController(disks=[], pci_func=0, pci_dev=4, pci_bus=0)
     # CXLMemory
     cxlmemory = CXLMemory(pci_func=0, pci_dev=6, pci_bus=0)
+    # CXL NMP Device
+    nmp_device = CXLNMPDevice(pci_func=0, pci_dev=7, pci_bus=0)
 
     def attachIO(self, bus, dma_ports):
         # Route interrupt signals
@@ -103,10 +106,13 @@ class SouthBridge(SimObject):
         self.dma1.pio = bus.mem_side_ports
         self.ide.pio = bus.mem_side_ports
         self.cxlmemory.cxl_rsp_port = bus.mem_side_ports
+        self.nmp_device.pio = bus.mem_side_ports
         if dma_ports.count(self.ide.dma) == 0:
             self.ide.dma = bus.cpu_side_ports
         if dma_ports.count(self.cxlmemory.dma) == 0:
             self.cxlmemory.dma = bus.cpu_side_ports
+        if dma_ports.count(self.nmp_device.dma) == 0:
+            self.nmp_device.dma = bus.cpu_side_ports
         self.keyboard.pio = bus.mem_side_ports
         self.pic1.pio = bus.mem_side_ports
         self.pic2.pio = bus.mem_side_ports

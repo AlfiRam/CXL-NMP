@@ -220,6 +220,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             self.cxl_mem_bus.cpu_side_ports = (
                 self.pc.south_bridge.cxlmemory.mem_req_port
             )
+            # Connect NMP device memory port to cxl_mem_bus (DIRECT access - no CXL Bridge overhead)
+            self.cxl_mem_bus.cpu_side_ports = (
+                self.pc.south_bridge.nmp_device.mem_port
+            )
             for _, port in cxl_dram.get_mem_ports():
                 self.cxl_mem_bus.mem_side_ports = port
 

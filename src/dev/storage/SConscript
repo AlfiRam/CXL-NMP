@@ -43,14 +43,17 @@ Import('*')
 # Controllers
 SimObject('Ide.py', sim_objects=['IdeDisk', 'IdeController'], enums=['IdeID'])
 SimObject('CXLMemory.py', sim_objects=['CXLMemory'])
+SimObject('CXLNMPDevice.py', sim_objects=['CXLNMPDevice'])
 
 Source('ide_ctrl.cc')
 Source('ide_disk.cc')
 Source('cxl_memory.cc')
+Source('cxl_nmp_device.cc')
 
 DebugFlag('IdeCtrl')
 DebugFlag('IdeDisk')
 DebugFlag('CXLMemory')
+DebugFlag('CXLNMPDevice')
 
 # Disk models
 SimObject('DiskImage.py', sim_objects=[
