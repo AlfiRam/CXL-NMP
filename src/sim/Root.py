@@ -75,3 +75,12 @@ class Root(SimObject):
     time_sync_spin_threshold = Param.Clock(
         "100us", "when less than this much time is left, spin"
     )
+
+    # Allow Root to own additional System children beyond the canonical
+    # 'system'/'board' attribute. The default empty list preserves
+    # backward compatibility for every existing config. Each entry
+    # becomes a SimObject child of Root and is initialised by
+    # m5.instantiate() the same way the primary system is.
+    systems = VectorParam.System(
+        [], "Additional System children of Root (e.g. an in-device CPU complex)"
+    )

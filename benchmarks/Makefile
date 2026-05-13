@@ -11,7 +11,7 @@ M5_INCLUDE = -I$(GEM5_INCLUDE)
 M5_LIB = $(M5_PATH)/build/x86/out/libm5.a
 
 # Targets
-TARGETS = memory_stride_access nmp_device_test nmp_ptr_chase_test
+TARGETS = memory_stride_access nmp_device_test nmp_ptr_chase_test device_cxl_test
 
 all: $(TARGETS)
 
@@ -39,6 +39,12 @@ nmp_ptr_chase_test: nmp_ptr_chase_test.c
 	fi
 	$(CC) $(CFLAGS) $(M5_INCLUDE) -o $@ $< $(M5_LIB)
 	@echo "Built: $@ (with m5ops linked)"
+
+# Device-side userspace test: mmap /dev/mem over the CXL range
+# and round-trip a 64-bit pattern to validate cxl_mem_bus access.
+device_cxl_test: device_cxl_test.c
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "Built: $@"
 
 # Clean
 clean:

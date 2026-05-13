@@ -1,0 +1,7 @@
+
+# Compiled binaries (build artifacts, not source)
+device_cxl_test
+device_firmware.elf
+host_f2_verify
+nmp_device_test
+nmp_ptr_chase_test

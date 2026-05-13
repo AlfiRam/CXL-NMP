@@ -171,10 +171,10 @@ command = (
 # Kernel and disk image paths
 board.set_kernel_disk_workload(
     kernel=KernelResource(
-        local_path="/home/malfiram/CXL-DMSim/fs_files/vmlinux_20240920"
+        local_path="/home/alfi/CXL-NMP/fs_files/vmlinux_20240920"
     ),
     disk_image=DiskImageResource(
-        local_path="/home/malfiram/CXL-DMSim/fs_files/parsec.img"
+        local_path="/home/alfi/CXL-NMP/fs_files/parsec.img"
     ),
     readfile_contents=command,
 )
