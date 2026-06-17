@@ -31,17 +31,47 @@
 #include <unistd.h>
 
 #include "cxl_mailbox.h"
+#include "blob_abi.h"
 
 /* Poll budget mirrors the host: the device may start before the host has
  * armed the doorbell, so it waits up to POLL_TRIES * POLL_SLEEP_US sim-us. */
 #define POLL_TRIES     100000
 #define POLL_SLEEP_US  1000
 
+/* OP_EXEC_BLOB sanity caps — bound the shipped code and operand sizes before
+ * we copy or execute anything out of the shared region. */
+#define MAX_BLOB_LEN   (1u << 20)   /* 1 MiB cap on shipped code */
+#define MAX_OPS        (1u << 20)   /* 1Mi-u64 operand cap       */
+
 static uint32_t read_command(volatile struct cxl_mailbox *mb)
 {
     mb_clflush(&mb->command);
     mb_mfence();
     return mb->command;
+}
+
+static const char *cmd_name(uint32_t cmd)
+{
+    switch (cmd) {
+    case OP_SUM_SCALARS: return "OP_SUM_SCALARS";
+    case OP_SUM_ARRAY:   return "OP_SUM_ARRAY";
+    case OP_EXEC_BLOB:   return "OP_EXEC_BLOB";
+    default:             return "OP_UNKNOWN";
+    }
+}
+
+/* Report a device-side error per the termination contract (a "DEVICE OFFLOAD
+ * ERROR ..." line so the f2 barrier ends the run) and tear down the mailbox
+ * mapping. Caller returns 1 afterward. */
+static void device_error(volatile struct cxl_mailbox *mb, void *map, int fd,
+                         const char *msg)
+{
+    mb->status = STATUS_ERROR;
+    mb->command = OP_NONE;
+    mb_flush_range((volatile void *)mb, sizeof(*mb));
+    printf("DEVICE OFFLOAD ERROR %s\n", msg);
+    munmap(map, MB_SIZE);
+    close(fd);
 }
 
 int main(void)
@@ -126,6 +156,81 @@ int main(void)
             result += data[i];
         break;
     }
+    case OP_EXEC_BLOB: {
+        /* Ship-a-binary path: the host placed a position-independent code
+         * blob at [data_off, data_len) and the operands at arg0. We copy the
+         * blob into a LOCAL executable page and call entry(args) on this
+         * device core (copy-then-exec — never execute from the UC CXL
+         * mapping). arg0=operand offset, arg1=count, arg2=nonce. */
+        uint64_t blob_off = mb->data_off;
+        uint64_t blob_len = mb->data_len;
+        uint64_t ops_off  = mb->arg0;
+        uint64_t n        = mb->arg1;
+        uint64_t nonce    = mb->arg2;
+        printf("[device] op=OP_EXEC_BLOB blob@0x%llx len=%llu "
+               "ops@0x%llx n=%llu nonce=0x%llx\n",
+               (unsigned long long)blob_off, (unsigned long long)blob_len,
+               (unsigned long long)ops_off, (unsigned long long)n,
+               (unsigned long long)nonce);
+
+        /* Bounds: keep blob + operands inside the mapped window and within
+         * sane caps before copying or executing anything. */
+        if (blob_len == 0 || blob_len > MAX_BLOB_LEN ||
+            blob_off > MB_SIZE || blob_off + blob_len > MB_SIZE ||
+            n > MAX_OPS ||
+            ops_off > MB_SIZE || ops_off + n * sizeof(uint64_t) > MB_SIZE) {
+            device_error(mb, map, fd, "OP_EXEC_BLOB bounds check failed");
+            return 1;
+        }
+
+        /* Executable page in device-LOCAL cacheable RAM. Instruction fetch
+         * from here is the normal proven path under AtomicSimpleCPU. */
+        long pg = sysconf(_SC_PAGESIZE);
+        size_t map_len = ((size_t)blob_len + pg - 1) & ~((size_t)pg - 1);
+        void *code = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (code == MAP_FAILED) {
+            device_error(mb, map, fd, "OP_EXEC_BLOB mmap exec page failed");
+            return 1;
+        }
+
+        /* Copy blob bytes out of the UC CXL region into local RAM. */
+        memcpy(code, (char *)map + blob_off, blob_len);
+
+        /* Flip to R+X (canonical JIT W->X) and sync I/D for the freshly
+         * written code before we fetch it. */
+        if (mprotect(code, map_len, PROT_READ | PROT_EXEC) != 0) {
+            munmap(code, map_len);
+            device_error(mb, map, fd, "OP_EXEC_BLOB mprotect R+X failed");
+            return 1;
+        }
+        __builtin___clear_cache((char *)code, (char *)code + blob_len);
+
+        /* Copy operands local too, so the blob touches ONLY local cacheable
+         * memory while it runs (no UC reads mid-execution). */
+        uint64_t *ops = NULL;
+        if (n > 0) {
+            ops = (uint64_t *)malloc(n * sizeof(uint64_t));
+            if (!ops) {
+                munmap(code, map_len);
+                device_error(mb, map, fd,
+                             "OP_EXEC_BLOB malloc operands failed");
+                return 1;
+            }
+            memcpy(ops, (char *)map + ops_off, n * sizeof(uint64_t));
+        }
+
+        /* Call the shipped code on this device core. */
+        struct blob_args a = { ops, n, nonce };
+        blob_entry_fn fn = (blob_entry_fn)code;
+        result = fn(&a);
+        printf("[device] blob entry() returned %llu (0x%llx)\n",
+               (unsigned long long)result, (unsigned long long)result);
+
+        free(ops);
+        munmap(code, map_len);
+        break;
+    }
     default:
         ok = 0;
         break;
@@ -156,8 +261,8 @@ int main(void)
     mb_clflush(&mb->command);
     mb_mfence();
 
-    printf("DEVICE OFFLOAD done op=%u result=%llu\n",
-           mb->opcount, (unsigned long long)result);
+    printf("DEVICE OFFLOAD done op=%s (opcount=%u) result=%llu\n",
+           cmd_name(cmd), mb->opcount, (unsigned long long)result);
 
     munmap(map, MB_SIZE);
     close(fd);

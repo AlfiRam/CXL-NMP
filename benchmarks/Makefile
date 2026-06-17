@@ -47,19 +47,52 @@ device_cxl_test: device_cxl_test.c
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Built: $@"
 
-# Host->device CXL offload MVP: shared-memory mailbox + doorbell.
+# --- OP_EXEC_BLOB code blob -------------------------------------------------
+# Freestanding, position-independent raw .text shipped through the mailbox and
+# executed on the device (see blob_fnv.c for the discipline). Flags keep the
+# emitted code relocation-free: no stack-protector ref, no CET endbr, no
+# unwind tables, no PIC/GOT.
+BLOB_CFLAGS = -ffreestanding -fno-pic -fno-stack-protector \
+              -fcf-protection=none -fno-asynchronous-unwind-tables \
+              -fno-unwind-tables -Os
+
+blob_fnv.o: blob_fnv.c blob_abi.h
+	$(CC) $(BLOB_CFLAGS) -c -o $@ $<
+
+# Verify gate, THEN extract raw .text. Fails the build if the blob would not
+# be position-independent (any .text relocation) or if entry isn't at offset 0.
+blob.bin: blob_fnv.o
+	@if objdump -r $< | grep -q 'RELOCATION RECORDS FOR \[.text\]'; then \
+		echo "ERROR: blob .text has relocations — not position-independent:"; \
+		objdump -r $<; exit 1; \
+	fi
+	@objdump -d $< | grep -qE '^0+ <entry>:' || { \
+		echo "ERROR: 'entry' is not at .text offset 0:"; objdump -d $<; exit 1; }
+	objcopy -O binary -j .text $< $@
+	@echo "Built: $@ ($$(wc -c < $@) bytes), entry@0, no .text relocs"
+
+# Bake the blob bytes into a C header (cxl_blob[] / cxl_blob_len) for the host.
+# xxd names the array after the file ("blob_bin"); rename to cxl_blob.
+blob_bytes.h: blob.bin
+	xxd -i $< > $@
+	sed -i 's/blob_bin/cxl_blob/g' $@
+	@echo "Generated: $@"
+
+# Host->device CXL offload: shared-memory mailbox + doorbell.
 # Both link no m5ops; both depend on the shared mailbox contract header.
-host_offload: host_offload.c cxl_mailbox.h
+# host_offload bakes in the blob (blob_bytes.h); device_offload needs the
+# blob entry ABI (blob_abi.h).
+host_offload: host_offload.c cxl_mailbox.h blob_bytes.h
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Built: $@"
 
-device_offload: device_offload.c cxl_mailbox.h
+device_offload: device_offload.c cxl_mailbox.h blob_abi.h
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Built: $@"
 
 # Clean
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f $(TARGETS) *.o blob.bin blob_bytes.h
 
 # Install to disk image (requires mount)
 install: $(TARGETS)

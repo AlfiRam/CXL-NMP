@@ -7,3 +7,7 @@ nmp_device_test
 nmp_ptr_chase_test
 host_offload
 device_offload
+
+# Generated OP_EXEC_BLOB artifacts (built from blob_fnv.c)
+blob.bin
+blob_bytes.h

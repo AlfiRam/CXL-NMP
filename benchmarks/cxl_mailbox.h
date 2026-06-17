@@ -54,7 +54,10 @@ enum mb_command {
     OP_NONE        = 0,   /* idle / disarmed (consumer writes this to ack) */
     OP_SUM_SCALARS = 1,   /* result = arg0 + arg1                          */
     OP_SUM_ARRAY   = 2,   /* result = sum of (data_len/8) u64s at data_off */
-    /* OP_EXEC_BLOB = 3   reserved: map [data_off,data_len) PROT_EXEC, call */
+    OP_EXEC_BLOB   = 3,   /* ship + run a code blob: device copies the bytes
+                           * at [data_off, data_len) into an executable page
+                           * and calls entry(args). arg0=operand offset,
+                           * arg1=operand count, arg2=nonce. See blob_abi.h. */
 };
 
 /* ---- Status values (written by the device) ---- */
