@@ -85,10 +85,44 @@ This config:
     (src/dev/serial/terminal.cc:131), so the file reflects guest
     serial output character-by-character with no buffering.
   - Wall-clock: ~25-30 min cold boot for each System, in parallel.
+
+Checkpoint/restore modes (added for fast iteration):
+
+  --take-checkpoint DIR : normal cold boot of both Systems; the guests
+     then PARK ALIVE in a minimal liveness loop (heartbeat + m5 exit +
+     sleep — deliberately dumb: no readfile re-read, no cmp/cp, so this
+     run validates the checkpoint MECHANISM only). When the serial
+     barrier is met, m5.checkpoint(DIR) is taken at a quiescent point
+     (NMP untouched, no DMA in flight) and the run exits. The exact
+     argv is recorded in DIR/TAKE_CMDLINE.txt for precise replay.
+  --restore DIR : rebuild the IDENTICAL config (same core counts,
+     memory sizes, --is_asic) and restore from DIR instead of
+     cold-booting. Success = both heartbeats appear in the FRESH
+     outdir's serial files (the boot-time PASS strings live in the
+     take-run's outdir and never reappear post-restore).
+
+  HISTORY — the first take/restore attempt failed exactly where the
+  original caveat predicted: CXLMemory::recvFunctional was an empty
+  stub, so memWriteback() at checkpoint time silently dropped every
+  dirty CXL-backed (NUMA node 1) cache line, and the restored host
+  panicked on zeroed node-1 page tables. Fixed in cxl_memory.{hh,cc}
+  (queue-sweeping functional forward, mirroring CXLBridge). The fix is
+  now validated by this config: the device writes an ASCII sentinel
+  into CXL DRAM during the take-run's parked state and every heartbeat
+  re-reads it; the restore barrier requires the sentinel to read back
+  correctly (device path), and host survival validates the host
+  functional-write path (its node-1 page tables must round-trip).
+
+  CONSEQUENCE of the dumb park loop: this checkpoint cannot have new
+  work injected at restore (the parked script reads nothing beyond the
+  sentinel address). The readfile-injection park loop comes in a LATER
+  take-run — one more cold dual-boot — once this mechanism is proven.
 """
 
 import argparse
 import os
+import sys
+from pathlib import Path
 
 import m5
 import m5.ticks
@@ -200,6 +234,7 @@ def serial_barrier_handler(
     device_serial_path: str,
     host_pass: str = "host boot OK",
     device_pass: str = "device boot OK",
+    checkpoint_dir: str = None,
 ):
     """Generator that yields True iff both Systems' PASS strings have
     appeared in their serial output. The Terminal SimObject is
@@ -217,11 +252,47 @@ def serial_barrier_handler(
 
     Yields False forever until both PASS strings are seen, then
     yields True once to terminate the run loop.
+
+    If `checkpoint_dir` is set, m5.checkpoint(checkpoint_dir) is called
+    at the moment the barrier is met, BEFORE yielding True. At that
+    point both guests are parked in their liveness loops: NMP device
+    untouched, no DMA in flight — the quiescent point required because
+    none of the custom CXL objects (cxl_bridge.cc, cxl_memory.cc,
+    cxl_nmp_device.cc) implements serialize() or drain().
+
+    HONEST CAVEAT — a clean checkpoint here is EVIDENCE, NOT PROOF that
+    the CXL path survives save/restore. m5.checkpoint() runs
+    memWriteback() first, and the host kernel enrolls CXL DRAM as
+    NUMA-node-1 RAM, so dirty CXL-backed cache lines (if any exist at
+    boot) must flush FUNCTIONALLY through CXLBridge -> CXLMemory.
+    CXLBridge supports functional access (cxl_bridge.cc:477); CXLMemory
+    has no functional-path code of its own. And the restored run
+    deliberately never reads CXL memory back. CXL-path integrity across
+    checkpoint/restore remains UNVERIFIED until a later run has a
+    restored guest read back known CXL contents.
     """
     while True:
         host_done = _serial_contains(host_serial_path, host_pass)
         dev_done = _serial_contains(device_serial_path, device_pass)
         if host_done and dev_done:
+            if checkpoint_dir is not None:
+                print(
+                    f"[barrier] both PASS strings seen — "
+                    f"writing checkpoint to {checkpoint_dir}"
+                )
+                # Same pattern as stdlib save_checkpoint_generator:
+                # m5.checkpoint() drains, runs memWriteback over both
+                # Systems, then serializes the global simObjectList.
+                m5.checkpoint(checkpoint_dir)
+                # Record the exact invocation so the restore run can
+                # replay an identical topology (restore matches
+                # checkpoint sections to SimObject paths; core count,
+                # memory sizes and --is_asic must not drift).
+                with open(
+                    os.path.join(checkpoint_dir, "TAKE_CMDLINE.txt"), "w"
+                ) as f:
+                    f.write("taken by: " + " ".join(sys.argv) + "\n")
+                print("[barrier] checkpoint written — ending simulation")
             print(
                 f"[barrier] both PASS strings seen "
                 f"(host_done={host_done}, dev_done={dev_done}) "
@@ -251,7 +322,60 @@ parser.add_argument(
     default="True",
     help="ASIC vs FPGA CXL device latency model (host-side only).",
 )
+parser.add_argument(
+    "--take-checkpoint",
+    metavar="DIR",
+    default=None,
+    help="Cold-boot both Systems; when the serial barrier is met "
+    "(both guests booted and parked in their liveness loops), "
+    "checkpoint into DIR and exit cleanly.",
+)
+parser.add_argument(
+    "--restore",
+    metavar="DIR",
+    default=None,
+    help="Restore both Systems from the checkpoint in DIR instead of "
+    "cold-booting. The config must be IDENTICAL to the "
+    "--take-checkpoint run (same core counts, memory sizes, "
+    "--is_asic) — see TAKE_CMDLINE.txt inside DIR.",
+)
+parser.add_argument(
+    "--atomic",
+    action="store_true",
+    help="Boot both Systems under ATOMIC CPUs instead of TIMING. "
+    "Dev-speed variant for functional work (the host->device handshake): "
+    "iterates in minutes, NO timing fidelity. Use TIMING (the default) "
+    "for timing-accurate/benchmark runs.",
+)
+parser.add_argument(
+    "--offload",
+    action="store_true",
+    help="MVP host->device code offload over a shared CXL mailbox. Host "
+    "carves the top 16 MiB of CXL as Reserved (memmap=) and runs "
+    "/home/cxl_benchmark/host_offload; device runs device_offload. "
+    "Intended with --atomic. Requires both binaries installed in the "
+    "guest image (benchmarks/Makefile `install`).",
+)
 args = parser.parse_args()
+if args.take_checkpoint and args.restore:
+    parser.error("--take-checkpoint and --restore are mutually exclusive.")
+if args.offload and (args.take_checkpoint or args.restore):
+    parser.error("--offload cannot be combined with --take-checkpoint/--restore.")
+# A checkpoint encodes its CPU class + mem_mode; ATOMIC and TIMING cannot
+# cross-restore. Fail fast rather than at opaque section-mismatch time.
+if args.atomic and (args.take_checkpoint or args.restore):
+    parser.error(
+        "--atomic cannot be combined with --take-checkpoint/--restore: "
+        "a checkpoint's CPU class and mem_mode are mode-specific."
+    )
+
+# Dev-speed vs timing-accurate selector. ATOMIC flips BOTH Systems'
+# SimpleProcessors; each board's incorporate_processor then sets its own
+# System.mem_mode to 'atomic' automatically (base_cpu_processor.py:99).
+# Classic caches are retained in either mode ('atomic', not the KVM/Ruby
+# 'atomic_noncaching' downgrade). ATOMIC + the custom CXL objects is
+# already proven by x86-cxl-run.py's atomic-boot path.
+_cpu_type = CPUTypes.ATOMIC if args.atomic else CPUTypes.TIMING
 
 
 # =============================================================================
@@ -271,9 +395,9 @@ if args.is_asic == "True":
 else:
     host_cxl_memory = SingleChannelDDR4_3200(size="8GB")
 
-# DIAGNOSTIC: host is TIMING-only. No KVM, no switch, no usePerf hack.
+# Host CPU: TIMING by default, ATOMIC under --atomic. No KVM, no switch.
 host_processor = SimpleProcessor(
-    cpu_type=CPUTypes.TIMING,
+    cpu_type=_cpu_type,
     isa=ISA.X86,
     num_cores=1,
 )
@@ -312,10 +436,20 @@ device_memory = SingleChannelDDR3_1600(size="512MB")
 # Device: TIMING-only from tick 0 (dual-KVM fallback documented in the
 # module docstring). No switchable processor, no usePerf hack — those
 # are KVM-specific concerns.
+#
+# CORE-COUNT CHANGE — deliberately the ONLY edit in this hunk so it is
+# separable from the checkpoint/restore plumbing below. 2 cores is the
+# first step toward a multi-core (Structera-A-like) device. Everything
+# downstream already scales with get_num_cores(): the IntelMP table and
+# apicbridge range in device_x86_board.py, and per-core L1/L2 in the
+# cache hierarchy. NOTE: this is the repo's first multi-core boot under
+# pure TIMING (all prior 2-core boots used KVM, which is foreclosed in
+# two-System runs). If boot hangs in SMP bring-up, set num_cores back
+# to 1 to isolate this change.
 device_processor = SimpleProcessor(
-    cpu_type=CPUTypes.TIMING,
+    cpu_type=_cpu_type,  # ATOMIC under --atomic; see _cpu_type above
     isa=ISA.X86,
-    num_cores=1,
+    num_cores=2,
 )
 
 device_board = DeviceX86Board(
@@ -335,27 +469,138 @@ device_board = DeviceX86Board(
 KERNEL_PATH = "/home/alfi/CXL-NMP/fs_files/vmlinux_20240920"
 DISK_PATH   = "/home/alfi/CXL-NMP/fs_files/parsec.img"
 
-# Host is TIMING from tick 0 — no leading `m5 exit;` (no switch).
+# Default (smoke-test) mode: one-shot PASS + m5 exit, unchanged.
+# Both Systems are TIMING from tick 0 — no leading `m5 exit;` (no switch).
 host_cmd = (
     "echo '=== host: X86Board on TIMING ===';"
     + "echo 'host boot OK';"
     + "m5 exit;"
 )
-# Device is TIMING from tick 0 — no leading `m5 exit;` (no switch).
-# Just print PASS and exit. The device's boot under TIMING is slow
-# (20-30 min cold) but the actual command run after boot is short.
 device_cmd = (
     "echo '=== device: DeviceX86Board on TIMING ===';"
     + "echo 'device boot OK';"
     + "m5 exit;"
 )
 
-host_board.set_kernel_disk_workload(
+# Checkpoint mode: print PASS, then PARK ALIVE in a minimal liveness
+# loop. Attempt C (module docstring) showed that after a one-shot
+# script ends, guest userspace dies and the last thread context
+# suspends — a checkpoint of that state restores a dead guest.
+#
+# DELIBERATELY DUMB: just heartbeat + m5 exit + sleep. No readfile
+# re-read, no cmp/cp. This run validates the checkpoint MECHANISM only
+# (first 2-core SMP-TIMING boot, first two-System checkpoint, first
+# save/restore over non-serialization-aware CXL objects); a smarter
+# readfile-injection loop would entangle a fourth unproven mechanism
+# with the restore path. CONSEQUENCE: this checkpoint cannot have new
+# work injected at restore — the parked script is baked into guest
+# memory and reads nothing. The workload-injection park loop comes in
+# a LATER take-run (one more cold boot), once this mechanism is proven.
+#
+# The heartbeat doubles as the restore marker: a restored run starts
+# in a fresh outdir with empty serial files, so the barrier must key
+# on output generated POST-restore — which a periodic heartbeat is,
+# within ~2 simulated seconds of resume.
+_liveness_loop = (
+    "while true; do "
+    "echo 'host alive'; "
+    "m5 exit; sleep 2; "
+    "done"
+)
+
+# CXL sentinel (device side). The DEVICE sees CXL as a Reserved E820
+# region, so /dev/mem access is permitted under STRICT_DEVMEM — the
+# same mechanism the proven device_cxl_test binary uses (mmap there,
+# dd here). Offset 64 KiB into the CXL range, matching that test's
+# TEST_OFFSET. 0x100010000 = 4295032832.
+#
+# The device writes the sentinel ONCE post-boot, and every heartbeat
+# re-reads it from CXL and prints it. Post-restore, device caches are
+# cold (never serialized), so the read must traverse device_iobridge
+# -> cxl_mem_bus -> DRAM: a true restored-content readback. The HOST
+# path (CXLMemory::recvFunctional fix) is validated by host survival —
+# the host kernel's own node-1 page tables are the sentinel there.
+#
+# ACCEPTED RISK: the host kernel owns this address as NUMA-node-1 RAM;
+# 17 bytes here could clobber host data if that page is allocated.
+# Boot-time node-1 allocations were observed near the TOP of the range
+# (the restore-bug crash dump), so bottom+64KiB is very likely free,
+# but unguaranteed until a proper shared-scratch carve-out exists.
+# There is also no coherence between host caches and device-side CXL
+# writes — harmless while the host is parked idle.
+_CXL_SENTINEL = "CXLSENTINEL_F2_OK"  # 17 bytes, ASCII so serial shows it
+_CXL_SENTINEL_ADDR = 4295032832      # 0x100010000
+_write_sentinel = (
+    f"printf '%s' '{_CXL_SENTINEL}' | "
+    f"dd of=/dev/mem bs=1 seek={_CXL_SENTINEL_ADDR} conv=notrunc 2>/dev/null; "
+)
+_read_sentinel = (
+    f"$(dd if=/dev/mem bs=1 skip={_CXL_SENTINEL_ADDR} "
+    f"count={len(_CXL_SENTINEL)} 2>/dev/null)"
+)
+_device_loop = (
+    "while true; do "
+    f'echo "device alive CXL={_read_sentinel}"; '
+    "m5 exit; sleep 2; "
+    "done"
+)
+if args.take_checkpoint or args.restore:
+    host_cmd = "echo 'host boot OK'; " + _liveness_loop
+    device_cmd = (
+        "echo 'device boot OK'; "
+        + _write_sentinel
+        + _device_loop
+    )
+    # In restore mode these contents are never read by the guests (the
+    # parked script reads nothing); they are written only so the
+    # config-time file plumbing is identical to the take-run.
+
+# Offload mode (MVP host->device CXL dispatch). Each side runs its offload
+# binary from the guest image. The programs rendezvous through the shared
+# CXL mailbox (host arms + rings the doorbell, device polls + executes +
+# returns a result); they self-synchronize, so host/device boot-order skew
+# is harmless. Every exit path of each binary prints its
+# "HOST OFFLOAD"/"DEVICE OFFLOAD" prefix, so the barrier (below) ends the
+# run on failure (TIMEOUT/ERROR) as well as success. The host's memmap=
+# carve-out is added to its kernel_args (below). Intended with --atomic.
+if args.offload:
+    host_cmd = (
+        "echo 'host boot OK'; "
+        "/home/cxl_benchmark/host_offload; "
+        "m5 exit;"
+    )
+    device_cmd = (
+        "echo 'device boot OK'; "
+        "/home/cxl_benchmark/device_offload; "
+        "m5 exit;"
+    )
+
+host_workload_kwargs = dict(
     kernel=KernelResource(local_path=KERNEL_PATH),
     disk_image=DiskImageResource(local_path=DISK_PATH),
     readfile=os.path.join(m5.options.outdir, "host_readfile"),
     readfile_contents=host_cmd,
 )
+if args.offload:
+    # Carve the top 16 MiB of the CXL window as Reserved on the HOST so
+    # host_offload can mmap /dev/mem at the mailbox base (0x2ff000000) —
+    # the host otherwise enrolls all of CXL as type-1 RAM, which
+    # STRICT_DEVMEM blocks from /dev/mem. memmap= also keeps the host page
+    # allocator out of it (no clobber). The device board is untouched: it
+    # already sees the whole CXL window as Reserved. Reuses the board's own
+    # default kernel args + the carve-out. Must match MB_BASE/MB_SIZE in
+    # benchmarks/cxl_mailbox.h.
+    host_workload_kwargs["kernel_args"] = (
+        host_board.get_default_kernel_args() + ["memmap=16M$0x2ff000000"]
+    )
+if args.restore:
+    # TwoSystemSimulator._instantiate consults ONLY the host board's
+    # _checkpoint (its existing `if self._board._checkpoint:` branch).
+    # m5.instantiate(dir) restores ALL SimObjects globally — including
+    # everything under Root.systems — so the device board needs no
+    # checkpoint reference of its own.
+    host_workload_kwargs["checkpoint"] = Path(args.restore)
+host_board.set_kernel_disk_workload(**host_workload_kwargs)
 device_board.set_kernel_disk_workload(
     kernel=KernelResource(local_path=KERNEL_PATH),
     disk_image=DiskImageResource(local_path=DISK_PATH),
@@ -377,6 +622,28 @@ device_board.set_kernel_disk_workload(
 HOST_SERIAL   = os.path.join(m5.options.outdir, "board.pc.com_1.device")
 DEVICE_SERIAL = os.path.join(m5.options.outdir, "systems.pc.com_1.device")
 
+# Restored runs key on the heartbeats (generated post-restore in the
+# fresh outdir), NOT the boot-time PASS strings (printed pre-checkpoint
+# into the take-run's outdir).
+if args.restore:
+    # Sentinel readback IS the restore success criterion (device path);
+    # host survival + heartbeat validates the host functional-write path.
+    PASS_HOST = "host alive"
+    PASS_DEV = f"CXL={_CXL_SENTINEL}"
+elif args.take_checkpoint:
+    # Require a sentinel heartbeat BEFORE checkpointing, so a broken
+    # sentinel write/read can never produce a poisoned checkpoint.
+    PASS_HOST = "host boot OK"
+    PASS_DEV = f"CXL={_CXL_SENTINEL}"
+elif args.offload:
+    # Both offload programs print their prefix on EVERY exit path
+    # (OK/FAIL/TIMEOUT/ERROR), so the barrier ends the run on failure as
+    # well as success — operator reads the actual status in serial.
+    PASS_HOST = "HOST OFFLOAD"
+    PASS_DEV = "DEVICE OFFLOAD"
+else:
+    PASS_HOST, PASS_DEV = "host boot OK", "device boot OK"
+
 simulator = TwoSystemSimulator(
     board=host_board,
     device_board=device_board,
@@ -384,17 +651,20 @@ simulator = TwoSystemSimulator(
         ExitEvent.EXIT: serial_barrier_handler(
             host_serial_path=HOST_SERIAL,
             device_serial_path=DEVICE_SERIAL,
-            host_pass="host boot OK",
-            device_pass="device boot OK",
+            host_pass=PASS_HOST,
+            device_pass=PASS_DEV,
+            checkpoint_dir=args.take_checkpoint,
         ),
     },
 )
 
+_cpu_label = "ATOMIC" if args.atomic else "TIMING"
 print("=" * 80)
-print("Two-System smoke test: TIMING-only + serial-output barrier")
+print(f"Two-System smoke test: {_cpu_label}-only + serial-output barrier")
 print("=" * 80)
-print(f"  Host board     : X86Board  (TIMING-only)  with CXLNMPDevice etc.")
-print(f"  Device board   : DeviceX86Board  (TIMING-only)  + device_iobridge")
+print(f"  CPU mode       : {'ATOMIC (dev-speed, no timing fidelity)' if args.atomic else 'TIMING'}")
+print(f"  Host board     : X86Board  ({_cpu_label}-only)  with CXLNMPDevice etc.")
+print(f"  Device board   : DeviceX86Board  ({_cpu_label}-only)  + device_iobridge")
 print(f"  cxl_mem_bus    : host_board.cxl_mem_bus  (CXLMemBar, 3 masters)")
 print(f"  CXL range      : 0x100000000, size {host_board.get_cxl_memory().get_size_str()}")
 print(f"  Host readfile  : {os.path.join(m5.options.outdir, 'host_readfile')}")
@@ -402,8 +672,40 @@ print(f"  Dev  readfile  : {os.path.join(m5.options.outdir, 'device_readfile')}"
 print(f"  Host serial    : {HOST_SERIAL}")
 print(f"  Dev  serial    : {DEVICE_SERIAL}")
 print(f"  Barrier        : sim ends when BOTH PASS strings appear in serial")
-print(f"                   ('host boot OK' AND 'device boot OK')")
-print(f"  Wall-clock     : both ~25-30 min cold boot (parallel under TIMING)")
+print(f"                   ('{PASS_HOST}' AND '{PASS_DEV}')")
+print(f"  Wall-clock     : {'~minutes cold boot (ATOMIC dev-speed)' if args.atomic else 'both ~25-30 min cold boot (parallel under TIMING)'}")
+mode = (
+    "take-checkpoint" if args.take_checkpoint
+    else "restore" if args.restore
+    else "offload" if args.offload
+    else "smoke-test"
+)
+print(f"  Mode           : {mode}")
+if args.offload:
+    print(f"  Offload        : host_offload -> CXL mailbox @ 0x2ff000000 -> device_offload")
+    print(f"  Host carve-out : memmap=16M$0x2ff000000 (Reserved, /dev/mem-mmappable)")
+    print(f"  Success        : 'HOST OFFLOAD ... OK' AND 'DEVICE OFFLOAD done ...'")
+    print(f"  NOTE           : barrier also ends on failure — every exit path")
+    print(f"                   prints HOST/DEVICE OFFLOAD (OK/FAIL/TIMEOUT/ERROR).")
+    print(f"                   Requires host_offload + device_offload installed")
+    print(f"                   in the guest image (benchmarks/Makefile install).")
+if args.take_checkpoint:
+    print(f"  Checkpoint dir : {args.take_checkpoint}")
+    print(f"  Barrier extra  : device must heartbeat 'CXL={_CXL_SENTINEL}'")
+    print(f"                   BEFORE the checkpoint is written — a broken")
+    print(f"                   sentinel write/read cannot poison the ckpt.")
+    print(f"  NOTE           : full validation is the RESTORE run reading")
+    print(f"                   the sentinel back from CXL DRAM (and the")
+    print(f"                   host surviving, post recvFunctional fix).")
+if args.restore:
+    print(f"  Restoring from : {args.restore}")
+    print(f"  Success        : 'host alive' AND 'CXL={_CXL_SENTINEL}' in")
+    print(f"                   the FRESH outdir serial files")
+    print(f"  NOTE           : validates restored CXL contents via the")
+    print(f"                   device-path sentinel readback; the host")
+    print(f"                   functional-write path is validated by host")
+    print(f"                   survival (its node-1 page tables must have")
+    print(f"                   round-tripped for it to run at all).")
 print("=" * 80)
 
 simulator.run()

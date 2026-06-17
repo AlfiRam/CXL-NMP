@@ -11,7 +11,8 @@ M5_INCLUDE = -I$(GEM5_INCLUDE)
 M5_LIB = $(M5_PATH)/build/x86/out/libm5.a
 
 # Targets
-TARGETS = memory_stride_access nmp_device_test nmp_ptr_chase_test device_cxl_test
+TARGETS = memory_stride_access nmp_device_test nmp_ptr_chase_test device_cxl_test \
+          host_offload device_offload
 
 all: $(TARGETS)
 
@@ -46,6 +47,16 @@ device_cxl_test: device_cxl_test.c
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Built: $@"
 
+# Host->device CXL offload MVP: shared-memory mailbox + doorbell.
+# Both link no m5ops; both depend on the shared mailbox contract header.
+host_offload: host_offload.c cxl_mailbox.h
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "Built: $@"
+
+device_offload: device_offload.c cxl_mailbox.h
+	$(CC) $(CFLAGS) -o $@ $<
+	@echo "Built: $@"
+
 # Clean
 clean:
 	rm -f $(TARGETS) *.o
@@ -63,6 +74,12 @@ install: $(TARGETS)
 		sudo cp nmp_ptr_chase_test /tmp/parsec_mount/home/cxl_benchmark/nmp_ptr_chase_test; \
 		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/nmp_ptr_chase_test; \
 		echo "Installed: /home/cxl_benchmark/nmp_ptr_chase_test"; \
+		sudo cp host_offload /tmp/parsec_mount/home/cxl_benchmark/host_offload; \
+		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/host_offload; \
+		echo "Installed: /home/cxl_benchmark/host_offload"; \
+		sudo cp device_offload /tmp/parsec_mount/home/cxl_benchmark/device_offload; \
+		sudo chmod +x /tmp/parsec_mount/home/cxl_benchmark/device_offload; \
+		echo "Installed: /home/cxl_benchmark/device_offload"; \
 	else \
 		echo "ERROR: Disk image not mounted at /tmp/parsec_mount"; \
 		echo "Run: sudo mount -o loop,offset=\$$((2048*512)) fs_files/parsec.img /tmp/parsec_mount"; \
