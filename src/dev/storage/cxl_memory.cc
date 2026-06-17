@@ -399,6 +399,50 @@ CXLMemory::CXLResponsePort::recvAtomicBackdoor(
         pkt, backdoor);
 }
 
+void
+CXLMemory::CXLResponsePort::recvFunctional(PacketPtr pkt)
+{
+    pkt->pushLabel(name());
+
+    // Check the response queue: a queued read response carries data
+    // newer than the backing store.
+    for (auto i = transmitList.begin(); i != transmitList.end(); ++i) {
+        if (pkt->trySatisfyFunctional((*i).pkt)) {
+            pkt->makeResponse();
+            return;
+        }
+    }
+
+    // Also check the request port's queue: a queued, not-yet-sent
+    // write holds the only copy of its data.
+    if (memReqPort.trySatisfyFunctional(pkt)) {
+        return;
+    }
+
+    pkt->popLabel();
+
+    // Not satisfied by any in-flight packet: forward to the backing
+    // memory media, latency-free (functional accesses carry no timing).
+    memReqPort.sendFunctional(pkt);
+}
+
+bool
+CXLMemory::CXLRequestPort::trySatisfyFunctional(PacketPtr pkt)
+{
+    bool found = false;
+    auto i = transmitList.begin();
+
+    while (i != transmitList.end() && !found) {
+        if (pkt->trySatisfyFunctional((*i).pkt)) {
+            pkt->makeResponse();
+            found = true;
+        }
+        ++i;
+    }
+
+    return found;
+}
+
 Cycles
 CXLMemory::CXLResponsePort::processCXLMem(PacketPtr pkt) {
     if (pkt->cxl_cmd == MemCmd::M2SReq) {

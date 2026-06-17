@@ -151,10 +151,30 @@ class CXLMemory : public PciDevice
                 Tick recvAtomicBackdoor(
                     PacketPtr pkt, MemBackdoorPtr &backdoor) override;
 
+                /**
+                 * Deliberate DECLINE, not an unimplemented stub: leaving
+                 * `backdoor` untouched (callers initialise it to nullptr)
+                 * tells the requester no backdoor is available and it falls
+                 * back to the packet path, which is correct after the
+                 * recvFunctional fix. Granting one would let the requester
+                 * bypass the CXL latency model for all subsequent accesses.
+                 * Do NOT panic here: KVM-boot configs (x86-cxl-nmp-run.py)
+                 * probe for backdoors against CXL-as-RAM and tolerate the
+                 * decline.
+                 */
                 void recvMemBackdoorReq(
                     const MemBackdoorReq &req, MemBackdoorPtr &backdoor) override {};
 
-                void recvFunctional(PacketPtr pkt) override {};
+                /**
+                 * Functional accesses MUST be honoured: m5.checkpoint()'s
+                 * memWriteback() flushes dirty cache lines functionally, and
+                 * this port is the host's only path into CXL DRAM. The
+                 * previous empty stub silently dropped these packets, losing
+                 * every dirty CXL-backed line at checkpoint time (restored
+                 * kernels saw zeroed node-1 pages, incl. page tables).
+                 * Mirrors CXLBridge::BridgeResponsePort::recvFunctional.
+                 */
+                void recvFunctional(PacketPtr pkt) override;
 
                 /** When receiving a address range request the Host,
                     pass it to the back-end memory media. */
@@ -232,6 +252,14 @@ class CXLMemory : public PciDevice
                 * @param when tick when response packet should be sent
                 */
                 void schedTimingReq(PacketPtr pkt, Tick when);
+
+                /**
+                 * Check the request queue for a packet that can satisfy a
+                 * functional access — a queued, not-yet-sent write holds the
+                 * only copy of its data. Mirrors
+                 * CXLBridge::BridgeRequestPort::trySatisfyFunctional.
+                 */
+                bool trySatisfyFunctional(PacketPtr pkt);
 
             protected:
                 /** When receiving a timing request from the back-end memory media,
