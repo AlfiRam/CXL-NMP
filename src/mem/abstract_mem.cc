@@ -129,6 +129,9 @@ AbstractMemory::MemStats::MemStats(AbstractMemory &_mem)
              "Number of write requests responded to by this memory"),
     ADD_STAT(numOther, statistics::units::Count::get(),
              "Number of other requests responded to by this memory"),
+    ADD_STAT(foreignRequestorAccesses, statistics::units::Count::get(),
+             "Accesses skipped from per-requestor stats because their "
+             "requestorId was out of range (cross-System packets)"),
     ADD_STAT(bwRead, statistics::units::Rate<
                 statistics::units::Byte, statistics::units::Second>::get(),
              "Total read bandwidth from this memory"),
@@ -395,6 +398,28 @@ AbstractMemory::access(PacketPtr pkt)
 
     uint8_t *host_addr = toHostAddr(pkt->getAddr());
 
+    // Per-requestor stats below are sized in regStats() by THIS memory's
+    // owning System's maxRequestors(), but indexed by the packet's
+    // requestorId(). In a two-System config that shares this backing (the
+    // CXL NMP work: the device CPU reaches this host-owned CXL DRAM through
+    // the stock device_iobridge), a cross-System packet carries a
+    // requestorId from the DEVICE System's namespace — out of range for
+    // this (host-sized) memory's vectors, which would trip the
+    // `index < size()` assert in statistics.hh. We therefore gate every
+    // per-requestor stat update on this bound and skip it for a foreign id,
+    // bumping foreignRequestorAccesses instead. The DATA PATH
+    // (setData/writeData/makeResponse) stays OUTSIDE the guard, so the
+    // access still completes correctly — only the stat is dropped.
+    //
+    // TIMING GAP: this guards only the ATOMIC path (recvAtomicLogic ->
+    // access()). The TIMING queue path has the identical latent assert in
+    // mem_ctrl.cc (stats.requestorReadAccesses[...] at :216, the response
+    // sites at :826-832) and in the QoS logRequest/logResponse path.
+    // Running the offload under TIMING will need the same guard replicated
+    // there; it is NOT fixed by this atomic-path change.
+    const RequestorID rid = pkt->req->requestorId();
+    const RequestorID num_requestors = system()->maxRequestors();
+
     if (pkt->cmd == MemCmd::SwapReq) {
         if (pkt->isAtomicOp()) {
             if (pmemAddr) {
@@ -433,7 +458,10 @@ AbstractMemory::access(PacketPtr pkt)
 
             assert(!pkt->req->isInstFetch());
             TRACE_PACKET("Read/Write");
-            stats.numOther[pkt->req->requestorId()]++;
+            if (rid < num_requestors)
+                stats.numOther[rid]++;
+            else
+                stats.foreignRequestorAccesses++;
         }
     } else if (pkt->isRead()) {
         assert(!pkt->isWrite());
@@ -447,10 +475,14 @@ AbstractMemory::access(PacketPtr pkt)
             pkt->setData(host_addr);
         }
         TRACE_PACKET(pkt->req->isInstFetch() ? "IFetch" : "Read");
-        stats.numReads[pkt->req->requestorId()]++;
-        stats.bytesRead[pkt->req->requestorId()] += pkt->getSize();
-        if (pkt->req->isInstFetch())
-            stats.bytesInstRead[pkt->req->requestorId()] += pkt->getSize();
+        if (rid < num_requestors) {
+            stats.numReads[rid]++;
+            stats.bytesRead[rid] += pkt->getSize();
+            if (pkt->req->isInstFetch())
+                stats.bytesInstRead[rid] += pkt->getSize();
+        } else {
+            stats.foreignRequestorAccesses++;
+        }
     } else if (pkt->isInvalidate() || pkt->isClean()) {
         assert(!pkt->isWrite());
         // in a fastmem system invalidating and/or cleaning packets
@@ -466,8 +498,12 @@ AbstractMemory::access(PacketPtr pkt)
             }
             assert(!pkt->req->isInstFetch());
             TRACE_PACKET("Write");
-            stats.numWrites[pkt->req->requestorId()]++;
-            stats.bytesWritten[pkt->req->requestorId()] += pkt->getSize();
+            if (rid < num_requestors) {
+                stats.numWrites[rid]++;
+                stats.bytesWritten[rid] += pkt->getSize();
+            } else {
+                stats.foreignRequestorAccesses++;
+            }
         }
     } else {
         panic("Unexpected packet %s", pkt->print());

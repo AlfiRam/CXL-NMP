@@ -197,6 +197,15 @@ class AbstractMemory : public ClockedObject
         statistics::Vector numWrites;
         /** Number of other requests */
         statistics::Vector numOther;
+        /**
+         * Aggregate count of accesses whose requestorId() was out of range
+         * for the per-requestor vectors above — i.e. cross-System packets
+         * (see AbstractMemory::access). Their per-requestor stats are
+         * intentionally skipped; this scalar keeps that drop visible
+         * instead of silent. A single scalar, so it has no requestor
+         * namespace and no sizing concern.
+         */
+        statistics::Scalar foreignRequestorAccesses;
         /** Read bandwidth from this memory */
         statistics::Formula bwRead;
         /** Read bandwidth from this memory */
