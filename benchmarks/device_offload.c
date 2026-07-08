@@ -56,6 +56,7 @@ static const char *cmd_name(uint32_t cmd)
     case OP_SUM_SCALARS: return "OP_SUM_SCALARS";
     case OP_SUM_ARRAY:   return "OP_SUM_ARRAY";
     case OP_EXEC_BLOB:   return "OP_EXEC_BLOB";
+    case OP_HANDOFF:     return "OP_HANDOFF";
     default:             return "OP_UNKNOWN";
     }
 }
@@ -72,6 +73,76 @@ static void device_error(volatile struct cxl_mailbox *mb, void *map, int fd,
     printf("DEVICE OFFLOAD ERROR %s\n", msg);
     munmap(map, MB_SIZE);
     close(fd);
+}
+
+/* Shared ship-a-binary mechanics for OP_EXEC_BLOB and OP_HANDOFF: bounds-check
+ * the blob descriptor, copy the blob bytes out of the UC mailbox into a LOCAL
+ * executable page (copy-then-exec — never execute from the UC CXL mapping),
+ * copy the operands from ops_src into LOCAL RAM (so the blob only touches
+ * cacheable local memory while it runs), and call entry(args) on this device
+ * core. The two ops differ ONLY in where ops_src points (mailbox data region
+ * vs the handed-off protected region) — the caller validates that location.
+ * Returns 0 with *result_out set, or 1 after device_error() (mailbox torn
+ * down; caller must unmap anything it mapped BEFORE calling). */
+static int exec_blob(volatile struct cxl_mailbox *mb, void *map, int fd,
+                     uint64_t blob_off, uint64_t blob_len,
+                     const void *ops_src, uint64_t n, uint64_t nonce,
+                     uint64_t *result_out)
+{
+    /* Bounds: keep the blob inside the mapped mailbox window and both blob
+     * and operand count within sane caps before copying or executing. */
+    if (blob_len == 0 || blob_len > MAX_BLOB_LEN ||
+        blob_off > MB_SIZE || blob_off + blob_len > MB_SIZE ||
+        n > MAX_OPS) {
+        device_error(mb, map, fd, "exec blob bounds check failed");
+        return 1;
+    }
+
+    /* Executable page in device-LOCAL cacheable RAM. Instruction fetch
+     * from here is the normal proven path under AtomicSimpleCPU. */
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t map_len = ((size_t)blob_len + pg - 1) & ~((size_t)pg - 1);
+    void *code = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        device_error(mb, map, fd, "exec blob mmap exec page failed");
+        return 1;
+    }
+
+    /* Copy blob bytes out of the UC CXL region into local RAM. */
+    memcpy(code, (char *)map + blob_off, blob_len);
+
+    /* Flip to R+X (canonical JIT W->X) and sync I/D for the freshly
+     * written code before we fetch it. */
+    if (mprotect(code, map_len, PROT_READ | PROT_EXEC) != 0) {
+        munmap(code, map_len);
+        device_error(mb, map, fd, "exec blob mprotect R+X failed");
+        return 1;
+    }
+    __builtin___clear_cache((char *)code, (char *)code + blob_len);
+
+    /* Copy operands local too. */
+    uint64_t *ops = NULL;
+    if (n > 0) {
+        ops = (uint64_t *)malloc(n * sizeof(uint64_t));
+        if (!ops) {
+            munmap(code, map_len);
+            device_error(mb, map, fd, "exec blob malloc operands failed");
+            return 1;
+        }
+        memcpy(ops, ops_src, n * sizeof(uint64_t));
+    }
+
+    /* Call the shipped code on this device core. */
+    struct blob_args a = { ops, n, nonce };
+    blob_entry_fn fn = (blob_entry_fn)code;
+    *result_out = fn(&a);
+    printf("[device] blob entry() returned %llu (0x%llx)\n",
+           (unsigned long long)*result_out, (unsigned long long)*result_out);
+
+    free(ops);
+    munmap(code, map_len);
+    return 0;
 }
 
 int main(void)
@@ -158,10 +229,9 @@ int main(void)
     }
     case OP_EXEC_BLOB: {
         /* Ship-a-binary path: the host placed a position-independent code
-         * blob at [data_off, data_len) and the operands at arg0. We copy the
-         * blob into a LOCAL executable page and call entry(args) on this
-         * device core (copy-then-exec — never execute from the UC CXL
-         * mapping). arg0=operand offset, arg1=count, arg2=nonce. */
+         * blob at [data_off, data_len) and the operands at arg0 — BOTH inside
+         * the mailbox. arg0=operand offset from MB_BASE, arg1=count,
+         * arg2=nonce. */
         uint64_t blob_off = mb->data_off;
         uint64_t blob_len = mb->data_len;
         uint64_t ops_off  = mb->arg0;
@@ -173,62 +243,83 @@ int main(void)
                (unsigned long long)ops_off, (unsigned long long)n,
                (unsigned long long)nonce);
 
-        /* Bounds: keep blob + operands inside the mapped window and within
-         * sane caps before copying or executing anything. */
-        if (blob_len == 0 || blob_len > MAX_BLOB_LEN ||
-            blob_off > MB_SIZE || blob_off + blob_len > MB_SIZE ||
-            n > MAX_OPS ||
-            ops_off > MB_SIZE || ops_off + n * sizeof(uint64_t) > MB_SIZE) {
-            device_error(mb, map, fd, "OP_EXEC_BLOB bounds check failed");
+        /* Operand location check (mailbox-relative); blob bounds are checked
+         * inside exec_blob(). */
+        if (ops_off > MB_SIZE || n > MAX_OPS ||
+            ops_off + n * sizeof(uint64_t) > MB_SIZE) {
+            device_error(mb, map, fd, "OP_EXEC_BLOB operand bounds failed");
             return 1;
         }
 
-        /* Executable page in device-LOCAL cacheable RAM. Instruction fetch
-         * from here is the normal proven path under AtomicSimpleCPU. */
-        long pg = sysconf(_SC_PAGESIZE);
-        size_t map_len = ((size_t)blob_len + pg - 1) & ~((size_t)pg - 1);
-        void *code = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (code == MAP_FAILED) {
-            device_error(mb, map, fd, "OP_EXEC_BLOB mmap exec page failed");
+        if (exec_blob(mb, map, fd, blob_off, blob_len,
+                      (char *)map + ops_off, n, nonce, &result))
+            return 1;
+        break;
+    }
+    case OP_HANDOFF: {
+        /* §6.2 subtree handoff (range-keyed) + compute on the handed-off
+         * data: the host has handed this device AUTHORITY over a contiguous
+         * PROTECTED CXL data range AND shipped work whose operands live
+         * INSIDE that range. arg0=region base (absolute CXL phys addr),
+         * arg1=region size, arg2=operand ABSOLUTE phys addr, arg3=operand
+         * count; data_off/data_len=the code blob, still in the MAILBOX
+         * (control channel). We print the handoff receipt, mmap the region,
+         * read the operands out of PROTECTED DRAM, and run the blob — the
+         * result can only match the host's expectation if the data really
+         * came from the handed-off region. The device verifier (gem5
+         * SimObject) was configured at instantiation with the same range and
+         * re-roots its integrity walk for it (the descriptor here is the
+         * modeled transfer; no node id is involved). */
+        uint64_t region_base = mb->arg0;
+        uint64_t region_size = mb->arg1;
+        uint64_t ops_abs     = mb->arg2;
+        uint64_t n           = mb->arg3;
+        uint64_t blob_off    = mb->data_off;
+        uint64_t blob_len    = mb->data_len;
+        printf("[device] op=OP_HANDOFF region=[0x%llx..0x%llx) size=0x%llx "
+               "ops@0x%llx n=%llu\n",
+               (unsigned long long)region_base,
+               (unsigned long long)(region_base + region_size),
+               (unsigned long long)region_size,
+               (unsigned long long)ops_abs, (unsigned long long)n);
+
+        /* Operand location check: the operands must lie INSIDE the
+         * handed-off region (absolute addressing; overflow-safe order). */
+        if (region_size == 0 || n == 0 || n > MAX_OPS ||
+            ops_abs < region_base ||
+            ops_abs - region_base > region_size ||
+            ops_abs - region_base + n * sizeof(uint64_t) > region_size) {
+            device_error(mb, map, fd, "OP_HANDOFF operand bounds failed");
             return 1;
         }
 
-        /* Copy blob bytes out of the UC CXL region into local RAM. */
-        memcpy(code, (char *)map + blob_off, blob_len);
-
-        /* Flip to R+X (canonical JIT W->X) and sync I/D for the freshly
-         * written code before we fetch it. */
-        if (mprotect(code, map_len, PROT_READ | PROT_EXEC) != 0) {
-            munmap(code, map_len);
-            device_error(mb, map, fd, "OP_EXEC_BLOB mprotect R+X failed");
+        /* Map the handed-off protected region (the device sees the whole CXL
+         * window as Reserved E820, so /dev/mem mmap works here like it does
+         * for the mailbox; UC mapping, atomic-safe). */
+        void *rmap = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, fd, (off_t)region_base);
+        if (rmap == MAP_FAILED) {
+            device_error(mb, map, fd, "OP_HANDOFF mmap region failed");
             return 1;
         }
-        __builtin___clear_cache((char *)code, (char *)code + blob_len);
 
-        /* Copy operands local too, so the blob touches ONLY local cacheable
-         * memory while it runs (no UC reads mid-execution). */
-        uint64_t *ops = NULL;
-        if (n > 0) {
-            ops = (uint64_t *)malloc(n * sizeof(uint64_t));
-            if (!ops) {
-                munmap(code, map_len);
-                device_error(mb, map, fd,
-                             "OP_EXEC_BLOB malloc operands failed");
-                return 1;
-            }
-            memcpy(ops, (char *)map + ops_off, n * sizeof(uint64_t));
+        /* Copy the operands out of the protected region into local RAM,
+         * unmap, then run the blob from the mailbox on the local copy. */
+        uint64_t *ops_local = (uint64_t *)malloc(n * sizeof(uint64_t));
+        if (!ops_local) {
+            munmap(rmap, region_size);
+            device_error(mb, map, fd, "OP_HANDOFF malloc operands failed");
+            return 1;
         }
+        memcpy(ops_local, (char *)rmap + (ops_abs - region_base),
+               n * sizeof(uint64_t));
+        munmap(rmap, region_size);
 
-        /* Call the shipped code on this device core. */
-        struct blob_args a = { ops, n, nonce };
-        blob_entry_fn fn = (blob_entry_fn)code;
-        result = fn(&a);
-        printf("[device] blob entry() returned %llu (0x%llx)\n",
-               (unsigned long long)result, (unsigned long long)result);
-
-        free(ops);
-        munmap(code, map_len);
+        int rc = exec_blob(mb, map, fd, blob_off, blob_len,
+                           ops_local, n, /*nonce=*/0, &result);
+        free(ops_local);
+        if (rc)
+            return 1;
         break;
     }
     default:

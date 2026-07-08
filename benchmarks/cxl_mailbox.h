@@ -42,6 +42,14 @@
 #define MB_DATA_OFF  0x1000ULL               /* data region starts after the
                                               * 4 KiB header page            */
 
+/* OP_HANDOFF operand placement inside the handed-off PROTECTED region: page 0
+ * of the region is reserved (future in-region attestation descriptor/receipt,
+ * mirroring the mailbox header-page/data-page split); operands start at page 1.
+ * Host-side contract only — the device locates the operands via the descriptor
+ * (arg2), never via this constant, so a plumbing bug fails loudly instead of
+ * accidentally agreeing. */
+#define HANDOFF_OPS_OFF  0x1000ULL
+
 /* Arbitrary sanity value ("CXL OFFLOAD" in leet) the consumer checks so a
  * mis-mapped / zeroed region is caught instead of silently summing zeros. */
 #define MB_MAGIC     0xC7110FF10ADULL
@@ -58,6 +66,24 @@ enum mb_command {
                            * at [data_off, data_len) into an executable page
                            * and calls entry(args). arg0=operand offset,
                            * arg1=operand count, arg2=nonce. See blob_abi.h. */
+    OP_HANDOFF     = 4,   /* §6.2 subtree handoff (range-keyed) + compute on the
+                           * handed-off data: host hands the device AUTHORITY
+                           * over a contiguous PROTECTED CXL data range and
+                           * ships work whose operands live INSIDE that range
+                           * (control/binary stay in the mailbox; data lives in
+                           * protected DRAM). No node id — the device verifier
+                           * re-roots by address-range membership. Descriptor:
+                           *   data_off/data_len = code blob in the MAILBOX
+                           *                       (same semantics as
+                           *                       OP_EXEC_BLOB),
+                           *   arg0 = region base (absolute CXL phys addr),
+                           *   arg1 = region size in bytes,
+                           *   arg2 = operand ABSOLUTE phys addr (inside the
+                           *          region; host uses base+HANDOFF_OPS_OFF),
+                           *   arg3 = operand count (u64 slots).
+                           * Device prints the handoff receipt, reads the
+                           * operands out of the handed-off region, runs the
+                           * blob, result = blob return (ciphertext). */
 };
 
 /* ---- Status values (written by the device) ---- */

@@ -356,11 +356,39 @@ parser.add_argument(
     "Intended with --atomic. Requires both binaries installed in the "
     "guest image (benchmarks/Makefile `install`).",
 )
+parser.add_argument(
+    "--device-integrity",
+    action="store_true",
+    help="Splice an IntegrityVerifier on the DEVICE System's read-from-CXL "
+    "(ingress) path, between the device membus and device_iobridge. The "
+    "verifier protects the shared CXL window (CxlOnly, TimingBmt) and is "
+    "inert/pass-through for the offload mailbox region. Default off. Under "
+    "--atomic the gate is build+boot+routing (config.ini), not stats.",
+)
+parser.add_argument(
+    "--device-handoff",
+    action="store_true",
+    help="§6.2 range-keyed subtree handoff (requires --device-integrity). The "
+    "host hands the device AUTHORITY over a contiguous region at the start of "
+    "the device's protected CXL window; the device verifier re-roots its "
+    "integrity walk for that range. The host offload runs the OP_HANDOFF "
+    "dispatch: XTEA blob ships in the mailbox (control channel) but the "
+    "key/plaintext operands are written INTO the handed-off protected region "
+    "(data path); the device prints the handoff receipt, reads the operands "
+    "out of the region, executes the blob, and returns the ciphertext. A "
+    "second host memmap= carve makes the region /dev/mem-mmappable. Default "
+    "off. Under --atomic the gate is config + receipt + ciphertext match "
+    "(functional data-binding), not stats.",
+)
 args = parser.parse_args()
 if args.take_checkpoint and args.restore:
     parser.error("--take-checkpoint and --restore are mutually exclusive.")
 if args.offload and (args.take_checkpoint or args.restore):
     parser.error("--offload cannot be combined with --take-checkpoint/--restore.")
+if args.device_handoff and not args.device_integrity:
+    parser.error("--device-handoff requires --device-integrity.")
+if args.device_handoff and not args.offload:
+    parser.error("--device-handoff requires --offload (it rides the mailbox).")
 # A checkpoint encodes its CPU class + mem_mode; ATOMIC and TIMING cannot
 # cross-restore. Fail fast rather than at opaque section-mismatch time.
 if args.atomic and (args.take_checkpoint or args.restore):
@@ -459,6 +487,13 @@ device_board = DeviceX86Board(
     cache_hierarchy=device_cache,
     cxl_mem_bus=cxl_mem_bus,
     cxl_mem_range=cxl_mem_range,
+    # Phase 3 M1: optional device-side verifier on the CXL-ingress path.
+    # Default off -> existing offload path unchanged. Ranges default inside
+    # the board (CxlOnly: protect bottom 2 GiB, exclude top-16 MiB mailbox).
+    cxl_integrity=args.device_integrity,
+    # Phase 3 M2: optional range-keyed subtree handoff (the board computes the
+    # handed-off region at the start of cxl_os and configures the verifier).
+    cxl_handoff=args.device_handoff,
 )
 
 
@@ -564,11 +599,26 @@ if args.take_checkpoint or args.restore:
 # run on failure (TIMEOUT/ERROR) as well as success. The host's memmap=
 # carve-out is added to its kernel_args (below). Intended with --atomic.
 if args.offload:
-    host_cmd = (
-        "echo 'host boot OK'; "
-        "/home/cxl_benchmark/host_offload; "
-        "m5 exit;"
-    )
+    if args.device_handoff:
+        # The board computed the handed-off region (start of cxl_os). Thread its
+        # base+size into the host guest so host_offload writes the OP_HANDOFF
+        # descriptor AND places the XTEA operands inside the region (at
+        # base+HANDOFF_OPS_OFF); the device prints the receipt, reads the
+        # operands out of the protected region, and runs the blob. Verifier was
+        # already configured with the same range at instantiation.
+        _ho_base = device_board._cxl_handoff_start
+        _ho_size = device_board._cxl_handoff_size
+        host_cmd = (
+            "echo 'host boot OK'; "
+            f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size}; "
+            "m5 exit;"
+        )
+    else:
+        host_cmd = (
+            "echo 'host boot OK'; "
+            "/home/cxl_benchmark/host_offload; "
+            "m5 exit;"
+        )
     device_cmd = (
         "echo 'device boot OK'; "
         "/home/cxl_benchmark/device_offload; "
@@ -590,8 +640,22 @@ if args.offload:
     # already sees the whole CXL window as Reserved. Reuses the board's own
     # default kernel args + the carve-out. Must match MB_BASE/MB_SIZE in
     # benchmarks/cxl_mailbox.h.
+    _host_memmap_args = ["memmap=16M$0x2ff000000"]
+    if args.device_handoff:
+        # Second carve: the handed-off protected region at the BOTTOM of the
+        # CXL window. The host enrolls the window as type-1 RAM, so without
+        # this the region is host page-allocator memory and STRICT_DEVMEM
+        # blocks /dev/mem there — host_offload could neither reach it nor
+        # safely write operands into it. Reserved => mmappable + host kernel
+        # keeps out (and the mapping is UC, atomic-safe, like the mailbox).
+        _ho_base = device_board._cxl_handoff_start
+        _ho_size = device_board._cxl_handoff_size
+        assert _ho_size % (1 << 20) == 0, (
+            "handoff region size must be MiB-aligned for the memmap= carve"
+        )
+        _host_memmap_args.append(f"memmap={_ho_size >> 20}M${_ho_base:#x}")
     host_workload_kwargs["kernel_args"] = (
-        host_board.get_default_kernel_args() + ["memmap=16M$0x2ff000000"]
+        host_board.get_default_kernel_args() + _host_memmap_args
     )
 if args.restore:
     # TwoSystemSimulator._instantiate consults ONLY the host board's
@@ -684,6 +748,17 @@ print(f"  Mode           : {mode}")
 if args.offload:
     print(f"  Offload        : host_offload -> CXL mailbox @ 0x2ff000000 -> device_offload")
     print(f"  Host carve-out : memmap=16M$0x2ff000000 (Reserved, /dev/mem-mmappable)")
+    if args.device_handoff:
+        _ho_base = device_board._cxl_handoff_start
+        _ho_size = device_board._cxl_handoff_size
+        print(f"  Handoff region : [{_ho_base:#x}..{_ho_base + _ho_size:#x}) "
+              f"(protected; verifier re-roots)")
+        print(f"  Handoff carve  : memmap={_ho_size >> 20}M${_ho_base:#x} "
+              f"(host Reserved; operands live at {_ho_base + 0x1000:#x})")
+        print(f"  Data binding   : blob in mailbox (control), XTEA operands in")
+        print(f"                   the handed-off PROTECTED region (data path);")
+        print(f"                   ciphertext match proves the device computed")
+        print(f"                   on data read out of the protected region.")
     print(f"  Success        : 'HOST OFFLOAD ... OK' AND 'DEVICE OFFLOAD done ...'")
     print(f"  NOTE           : barrier also ends on failure — every exit path")
     print(f"                   prints HOST/DEVICE OFFLOAD (OK/FAIL/TIMEOUT/ERROR).")
