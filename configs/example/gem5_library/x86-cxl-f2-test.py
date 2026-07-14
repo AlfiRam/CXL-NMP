@@ -44,7 +44,20 @@ Earlier attempts and the lessons we kept:
 
   Attempt A — dual KVM on both Systems:
      gem5 hung at "Starting simulation..." with both serial consoles
-     silent. Multiple KvmVMs in one gem5 process is unsupported.
+     silent. Concluded at the time: multiple KvmVMs in one gem5 process
+     is unsupported.
+     RESOLVED — that conclusion was wrong. The hang was an eventq_index
+     collision: each processor's incorporate_processor numbers its KVM
+     cores' event queues from 1 independently (base_cpu_processor.py:
+     75-79), so the host core and device core 0 shared queue 1 — one
+     thread, two vCPUs, and KVM's per-thread signal/timer setup
+     (cpu/kvm/base.cc:254-261) starved one of them inside KVM_RUN.
+     With globally disjoint queues (TwoSystemSimulator._instantiate)
+     both Systems boot Linux under KVM concurrently (--dual-kvm, proven
+     2026-07). Multi-KvmVM per process works: KvmVM is per-System with
+     its own /dev/kvm+VM fds (vm.cc:316-324). --kvm-boot builds on
+     this: KVM boot -> switch BOTH to ATOMIC at the boot barrier ->
+     workload under ATOMIC.
 
   Attempt B — KVM on host, TIMING on device from tick 0:
      Host's Linux reached MP-BIOS init then panicked at the
@@ -179,6 +192,45 @@ class TwoSystemSimulator(Simulator):
         self._board._pre_instantiate()
         self._device_board._pre_instantiate()
 
+        # DUAL-KVM FIX (proven by the --dual-kvm experiment): each
+        # processor's incorporate_processor numbers its KVM cores' event
+        # queues from 1 INDEPENDENTLY (base_cpu_processor.py:75-79; the
+        # same per-processor numbering exists in switchable_processor.py:
+        # 96-106, so SimpleSwitchableProcessor under --kvm-boot collides
+        # identically), so with two boards the host core and device core 0
+        # both land on queue 1 — one thread hosting two vCPUs from two
+        # VMs. KVM's counter/timer signal delivery is set up per-thread
+        # ("to ensure that signals are delivered to the right threads",
+        # cpu/kvm/base.cc:254-261), so a shared queue can leave a vCPU
+        # stuck in KVM_RUN with no timer kick — Attempt A's silent hang.
+        # Renumber ALL KVM cores across BOTH boards into one global 1..N
+        # range (queue 0 stays reserved for every non-CPU SimObject, which
+        # incorporate_processor already assigned; a SwitchableProcessor's
+        # get_cores() returns its CURRENT cores — the KVM start cores —
+        # and its switched-out ATOMIC cores stay on queue 0). This must
+        # happen after _pre_instantiate (which assigns the colliding
+        # indices) and before m5.instantiate (which sizes the event-queue
+        # array).
+        kvm_cores = [
+            c
+            for proc in (self._board.processor,
+                         self._device_board.processor)
+            for c in proc.get_cores()
+            if c.is_kvm_core()
+        ]
+        for i, core in enumerate(kvm_cores):
+            core.get_simobject().eventq_index = i + 1
+        if kvm_cores:
+            queues = [c.get_simobject().eventq_index for c in kvm_cores]
+            assert len(set(queues)) == len(queues), (
+                "KVM event-queue renumbering failed to produce disjoint "
+                f"queues: {queues}"
+            )
+            print(
+                f"[kvm-eventq] {len(kvm_cores)} KVM cores on disjoint event "
+                f"queues {queues} (queue 0 = all other SimObjects)"
+            )
+
         # Both Systems attached to Root: host via the canonical `board=`
         # kwarg, device via the new VectorParam.System added to Root.py
         # by the earlier single-system stub variant.
@@ -308,6 +360,90 @@ def serial_barrier_handler(
             yield False
 
 
+def kvm_boot_barrier_handler(
+    host_serial_path: str,
+    device_serial_path: str,
+    boot_host: str,
+    boot_dev: str,
+    done_host: str,
+    done_dev: str,
+    host_processor,
+    device_processor,
+    host_readfile_path: str,
+    device_readfile_path: str,
+    host_phase2: str,
+    device_phase2: str,
+):
+    """Two-phase barrier for --kvm-boot.
+
+    Phase 1 (KVM boot): every exit event rechecks the serials for BOTH
+    boot PASS strings. The guests park in a heartbeat/poll loop after
+    their PASS echo, so exit events keep arriving — this is what makes
+    the barrier robust to the KVM serial-drain race (a PASS string can
+    land in the file AFTER the exit event of the m5op that followed it;
+    diagnosed on the --dual-kvm smoke run, where the run's LAST event
+    preceded the device's PASS landing and the barrier starved).
+
+    At the barrier: BOTH processors switch KVM->ATOMIC together, never
+    per-System — a lone ATOMIC System coexisting with a still-booting
+    KVM System recreates Attempt B's TSC-drift hazard (module
+    docstring). m5.switchCpus does the takeover and flips each System's
+    memory mode itself (m5/simulate.py, "Change the memory mode if
+    required"). The workload is then RELEASED by rewriting each board's
+    readfile with the phase-2 script: pseudo_inst::readfile re-opens
+    the file on every call (src/sim/pseudo_inst.cc:376-384), so the
+    guests' poll loops observe the marker on their next iteration and
+    exec the workload — entirely under ATOMIC.
+
+    Phase 2 (ATOMIC workload): terminate when both completion strings
+    appear. The phase-2 scripts end in the same heartbeat loop, so the
+    completion strings are also drain-race-immune.
+    """
+    switched = False
+    while True:
+        if not switched:
+            hb = _serial_contains(host_serial_path, boot_host)
+            db = _serial_contains(device_serial_path, boot_dev)
+            if hb and db:
+                print(
+                    "[kvm-boot] boot barrier met — switching BOTH "
+                    "processors KVM->ATOMIC together"
+                )
+                with open(host_readfile_path, "w") as f:
+                    f.write(host_phase2)
+                with open(device_readfile_path, "w") as f:
+                    f.write(device_phase2)
+                host_processor.switch()
+                device_processor.switch()
+                switched = True
+                print(
+                    "[kvm-boot] switch complete; phase-2 workload "
+                    "injected via readfile — continuing under ATOMIC"
+                )
+                yield False
+            else:
+                print(
+                    f"[kvm-boot] boot barrier not met "
+                    f"(host={hb}, dev={db}) — continuing under KVM"
+                )
+                yield False
+        else:
+            hd = _serial_contains(host_serial_path, done_host)
+            dd = _serial_contains(device_serial_path, done_dev)
+            if hd and dd:
+                print(
+                    "[kvm-boot] workload barrier met "
+                    f"(host_done={hd}, dev_done={dd}) — ending simulation"
+                )
+                yield True
+            else:
+                print(
+                    f"[kvm-boot] post-switch; workload barrier not met "
+                    f"(host={hd}, dev={dd}) — continuing"
+                )
+                yield False
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -346,6 +482,41 @@ parser.add_argument(
     "Dev-speed variant for functional work (the host->device handshake): "
     "iterates in minutes, NO timing fidelity. Use TIMING (the default) "
     "for timing-accurate/benchmark runs.",
+)
+parser.add_argument(
+    "--dual-kvm",
+    action="store_true",
+    help="EXPERIMENT: boot BOTH Systems under KVM cores. Exists purely to "
+    "answer one question — does dual-KVM boot when the two Systems' KVM "
+    "vCPUs are on DISJOINT event queues? (Attempt A in the module docstring "
+    "hung with both serials silent; the suspected cause is the stdlib's "
+    "per-processor eventq numbering, base_cpu_processor.py:75-79, which "
+    "lands the host core and device core 0 on the SAME queue — KVM's "
+    "signal/timer setup is thread-specific, base.cc:254-261. "
+    "TwoSystemSimulator._instantiate renumbers the queues disjointly.) "
+    "Boot-only smoke test: not combinable with any other mode flag.",
+)
+parser.add_argument(
+    "--kvm-boot",
+    action="store_true",
+    help="Boot BOTH Systems under KVM (fast, minutes), then switch BOTH to "
+    "ATOMIC at the boot barrier and run the workload under ATOMIC. Uses "
+    "SimpleSwitchableProcessor(KVM->ATOMIC) per board plus the disjoint "
+    "event-queue renumbering proven by --dual-kvm. The guests park in a "
+    "heartbeat/poll loop after boot; when both PASS strings are in serial "
+    "the handler switches both processors TOGETHER (never per-System — "
+    "Attempt B's TSC hazard) and releases the workload by rewriting each "
+    "board's readfile (m5 readfile re-reads the file per call, "
+    "pseudo_inst.cc:376). Composes with --offload/--device-integrity/"
+    "--device-handoff; the workload runs entirely under ATOMIC.",
+)
+parser.add_argument(
+    "--kvm-no-perf",
+    action="store_true",
+    help="With --dual-kvm/--kvm-boot: set usePerf=False on every KVM core. "
+    "Diagnostic fallback ONLY — use if the KVM run dies at startup with a "
+    "perf_event_open error (host perf_event_paranoid too strict) so a perf "
+    "permission failure is not misread as the Attempt-A hang.",
 )
 parser.add_argument(
     "--offload",
@@ -396,6 +567,41 @@ if args.atomic and (args.take_checkpoint or args.restore):
         "--atomic cannot be combined with --take-checkpoint/--restore: "
         "a checkpoint's CPU class and mem_mode are mode-specific."
     )
+# --dual-kvm is a boot-only experiment (does dual-KVM boot with disjoint
+# event queues?). Reject every other mode flag so the result answers
+# exactly that question, with no offload/verifier/checkpoint variables.
+if args.dual_kvm and (
+    args.atomic
+    or args.offload
+    or args.take_checkpoint
+    or args.restore
+    or args.device_integrity
+    or args.device_handoff
+):
+    parser.error(
+        "--dual-kvm is a boot-only smoke test; it cannot be combined with "
+        "--atomic/--offload/--take-checkpoint/--restore/--device-integrity/"
+        "--device-handoff."
+    )
+if args.kvm_boot and args.dual_kvm:
+    parser.error(
+        "--kvm-boot and --dual-kvm are mutually exclusive (--dual-kvm is "
+        "the boot-only experiment; --kvm-boot is the production KVM->ATOMIC "
+        "flow)."
+    )
+if args.kvm_boot and args.atomic:
+    parser.error(
+        "--kvm-boot already ends in ATOMIC (KVM boot, ATOMIC workload); "
+        "drop --atomic."
+    )
+if args.kvm_boot and (args.take_checkpoint or args.restore):
+    parser.error(
+        "--kvm-boot cannot be combined with --take-checkpoint/--restore "
+        "yet: switched-out cores and the mid-run readfile rewrite are not "
+        "part of the proven checkpoint mechanism."
+    )
+if args.kvm_no_perf and not (args.dual_kvm or args.kvm_boot):
+    parser.error("--kvm-no-perf only applies to --dual-kvm/--kvm-boot.")
 
 # Dev-speed vs timing-accurate selector. ATOMIC flips BOTH Systems'
 # SimpleProcessors; each board's incorporate_processor then sets its own
@@ -403,7 +609,14 @@ if args.atomic and (args.take_checkpoint or args.restore):
 # Classic caches are retained in either mode ('atomic', not the KVM/Ruby
 # 'atomic_noncaching' downgrade). ATOMIC + the custom CXL objects is
 # already proven by x86-cxl-run.py's atomic-boot path.
-_cpu_type = CPUTypes.ATOMIC if args.atomic else CPUTypes.TIMING
+# --dual-kvm flips both to KVM cores instead (mem_mode becomes
+# 'atomic_noncaching' via the same incorporate_processor path; caches are
+# present but bypassed — irrelevant for the boot-only experiment).
+_cpu_type = (
+    CPUTypes.KVM if args.dual_kvm
+    else CPUTypes.ATOMIC if args.atomic
+    else CPUTypes.TIMING
+)
 
 
 # =============================================================================
@@ -423,12 +636,24 @@ if args.is_asic == "True":
 else:
     host_cxl_memory = SingleChannelDDR4_3200(size="8GB")
 
-# Host CPU: TIMING by default, ATOMIC under --atomic. No KVM, no switch.
-host_processor = SimpleProcessor(
-    cpu_type=_cpu_type,
-    isa=ISA.X86,
-    num_cores=1,
-)
+# Host CPU: TIMING by default, ATOMIC under --atomic, KVM under --dual-kvm.
+# Under --kvm-boot: a switchable KVM->ATOMIC pair. The KVM start cores and
+# the ATOMIC switch cores share SimObject paths, and m5.switchCpus performs
+# the takeover + per-System memory-mode change itself (m5/simulate.py,
+# "Change the memory mode if required").
+if args.kvm_boot:
+    host_processor = SimpleSwitchableProcessor(
+        starting_core_type=CPUTypes.KVM,
+        switch_core_type=CPUTypes.ATOMIC,
+        isa=ISA.X86,
+        num_cores=1,
+    )
+else:
+    host_processor = SimpleProcessor(
+        cpu_type=_cpu_type,
+        isa=ISA.X86,
+        num_cores=1,
+    )
 
 host_board = X86Board(
     clk_freq="2.4GHz",
@@ -474,11 +699,32 @@ device_memory = SingleChannelDDR3_1600(size="512MB")
 # pure TIMING (all prior 2-core boots used KVM, which is foreclosed in
 # two-System runs). If boot hangs in SMP bring-up, set num_cores back
 # to 1 to isolate this change.
-device_processor = SimpleProcessor(
-    cpu_type=_cpu_type,  # ATOMIC under --atomic; see _cpu_type above
-    isa=ISA.X86,
-    num_cores=2,
-)
+if args.kvm_boot:
+    device_processor = SimpleSwitchableProcessor(
+        starting_core_type=CPUTypes.KVM,
+        switch_core_type=CPUTypes.ATOMIC,
+        isa=ISA.X86,
+        num_cores=2,
+    )
+else:
+    device_processor = SimpleProcessor(
+        cpu_type=_cpu_type,  # ATOMIC under --atomic; see _cpu_type above
+        isa=ISA.X86,
+        num_cores=2,
+    )
+
+if args.kvm_no_perf:
+    # Diagnostic fallback (see --kvm-no-perf help): drop the per-vCPU perf
+    # counters so a perf_event_open permission failure can't masquerade as
+    # the Attempt-A hang. usePerf defaults True (BaseKvmCPU.py:66); with it
+    # False the KVM CPU paces itself by the host timer alone (the
+    # usePerfOverflow default is False, so base.cc:103's fatal cannot fire).
+    # get_cores() returns the CURRENT cores — under --kvm-boot those are the
+    # KVM start cores (the ATOMIC switch cores have no usePerf param, so the
+    # is_kvm_core guard matters there).
+    for _core in (*host_processor.get_cores(), *device_processor.get_cores()):
+        if _core.is_kvm_core():
+            _core.get_simobject().usePerf = False
 
 device_board = DeviceX86Board(
     clk_freq="1GHz",
@@ -608,22 +854,83 @@ if args.offload:
         # already configured with the same range at instantiation.
         _ho_base = device_board._cxl_handoff_start
         _ho_size = device_board._cxl_handoff_size
-        host_cmd = (
-            "echo 'host boot OK'; "
-            f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size}; "
-            "m5 exit;"
+        _host_work = (
+            f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size};"
         )
     else:
-        host_cmd = (
-            "echo 'host boot OK'; "
-            "/home/cxl_benchmark/host_offload; "
-            "m5 exit;"
-        )
-    device_cmd = (
-        "echo 'device boot OK'; "
-        "/home/cxl_benchmark/device_offload; "
-        "m5 exit;"
+        _host_work = "/home/cxl_benchmark/host_offload;"
+    _device_work = "/home/cxl_benchmark/device_offload;"
+    host_cmd = "echo 'host boot OK'; " + _host_work + " m5 exit;"
+    device_cmd = "echo 'device boot OK'; " + _device_work + " m5 exit;"
+
+# --kvm-boot: two-phase guest scripts. Phase 1 (the initial readfile) prints
+# the boot PASS and PARKS in a heartbeat/poll loop; phase 2 (the workload) is
+# injected by the handler at switch time by REWRITING the readfile —
+# pseudo_inst::readfile re-opens the file per call (pseudo_inst.cc:376-384).
+#
+# Why the park loop (and not a one-shot `sleep 2; m5 exit`): (a) the
+# early-booting System must wait an UNBOUNDED time for the late one, so no
+# fixed number of extra exits suffices; (b) the loop's periodic m5 exits are
+# what make the boot barrier immune to the KVM serial-drain race (the PASS
+# string can land in the file after the exit event that followed it — the
+# diagnosed --dual-kvm hang); (c) polling `m5 readfile` doubles as the
+# release mechanism, so the workload provably starts only after the switch.
+# This is the same parked-heartbeat pattern the checkpoint path validated.
+#
+# The grep pattern is quote-split so the phase-1 script does NOT itself
+# contain the contiguous marker (else the poll would match its own script
+# text and re-exec phase 1 as the workload).
+_KVM_PHASE2_MARKER = "KVMBOOT_PHASE2_GO"
+_kvm_marker_grep = 'KVMBOOT_"PHASE2"_GO'
+
+
+def _kvm_phase1(pass_echo: str) -> str:
+    return (
+        f"echo '{pass_echo}'; "
+        "while true; do "
+        "m5 exit; "
+        f"if m5 readfile | grep -q {_kvm_marker_grep}; then "
+        "m5 readfile > /tmp/phase2.sh; sh /tmp/phase2.sh; break; "
+        "fi; "
+        "sleep 1; "
+        "done"
     )
+
+
+# Post-workload heartbeat: keeps exit events coming so the completion
+# strings are also drain-race-immune (the barrier just needs one event
+# after the strings land).
+_KVM_PHASE2_TAIL = "while true; do m5 exit; sleep 2; done\n"
+
+if args.kvm_boot:
+    if args.offload:
+        _host_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'host phase2 start (ATOMIC)'\n"
+            f"{_host_work}\n"
+            + _KVM_PHASE2_TAIL
+        )
+        _device_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'device phase2 start (ATOMIC)'\n"
+            f"{_device_work}\n"
+            + _KVM_PHASE2_TAIL
+        )
+    else:
+        # Plain --kvm-boot smoke: phase 2 just proves the switch landed and
+        # the guests still execute post-switch.
+        _host_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'host post-switch OK'\n"
+            + _KVM_PHASE2_TAIL
+        )
+        _device_phase2 = (
+            f"# {_KVM_PHASE2_MARKER}\n"
+            "echo 'device post-switch OK'\n"
+            + _KVM_PHASE2_TAIL
+        )
+    host_cmd = _kvm_phase1("host boot OK")
+    device_cmd = _kvm_phase1("device boot OK")
 
 host_workload_kwargs = dict(
     kernel=KernelResource(local_path=KERNEL_PATH),
@@ -703,26 +1010,58 @@ elif args.offload:
     # Both offload programs print their prefix on EVERY exit path
     # (OK/FAIL/TIMEOUT/ERROR), so the barrier ends the run on failure as
     # well as success — operator reads the actual status in serial.
+    # (Also the phase-2 termination strings under --kvm-boot --offload.)
     PASS_HOST = "HOST OFFLOAD"
     PASS_DEV = "DEVICE OFFLOAD"
+elif args.kvm_boot:
+    # Plain --kvm-boot smoke: terminate on the phase-2 post-switch echoes
+    # (the boot PASS strings only drive the SWITCH barrier in this mode).
+    PASS_HOST, PASS_DEV = "host post-switch OK", "device post-switch OK"
 else:
     PASS_HOST, PASS_DEV = "host boot OK", "device boot OK"
+
+if args.kvm_boot:
+    # Two-phase handler: boot barrier (switch BOTH + inject phase 2) then
+    # workload barrier (terminate on PASS_HOST/PASS_DEV).
+    _exit_handler = kvm_boot_barrier_handler(
+        host_serial_path=HOST_SERIAL,
+        device_serial_path=DEVICE_SERIAL,
+        boot_host="host boot OK",
+        boot_dev="device boot OK",
+        done_host=PASS_HOST,
+        done_dev=PASS_DEV,
+        host_processor=host_processor,
+        device_processor=device_processor,
+        host_readfile_path=os.path.join(m5.options.outdir, "host_readfile"),
+        device_readfile_path=os.path.join(
+            m5.options.outdir, "device_readfile"
+        ),
+        host_phase2=_host_phase2,
+        device_phase2=_device_phase2,
+    )
+else:
+    _exit_handler = serial_barrier_handler(
+        host_serial_path=HOST_SERIAL,
+        device_serial_path=DEVICE_SERIAL,
+        host_pass=PASS_HOST,
+        device_pass=PASS_DEV,
+        checkpoint_dir=args.take_checkpoint,
+    )
 
 simulator = TwoSystemSimulator(
     board=host_board,
     device_board=device_board,
     on_exit_event={
-        ExitEvent.EXIT: serial_barrier_handler(
-            host_serial_path=HOST_SERIAL,
-            device_serial_path=DEVICE_SERIAL,
-            host_pass=PASS_HOST,
-            device_pass=PASS_DEV,
-            checkpoint_dir=args.take_checkpoint,
-        ),
+        ExitEvent.EXIT: _exit_handler,
     },
 )
 
-_cpu_label = "ATOMIC" if args.atomic else "TIMING"
+_cpu_label = (
+    "KVM->ATOMIC" if args.kvm_boot
+    else "KVM" if args.dual_kvm
+    else "ATOMIC" if args.atomic
+    else "TIMING"
+)
 print("=" * 80)
 print(f"Two-System smoke test: {_cpu_label}-only + serial-output barrier")
 print("=" * 80)
@@ -742,9 +1081,25 @@ mode = (
     "take-checkpoint" if args.take_checkpoint
     else "restore" if args.restore
     else "offload" if args.offload
+    else "dual-kvm boot experiment" if args.dual_kvm
     else "smoke-test"
 )
+if args.kvm_boot:
+    mode += " (KVM boot -> switch both -> ATOMIC workload)"
 print(f"  Mode           : {mode}")
+if args.kvm_boot:
+    print(f"  KVM boot       : both Systems boot under KVM (disjoint event")
+    print(f"                   queues); guests park in heartbeat/poll loops.")
+    print(f"                   Boot barrier ('host boot OK' AND 'device boot")
+    print(f"                   OK') -> switch BOTH to ATOMIC together ->")
+    print(f"                   phase-2 workload injected via readfile.")
+    print(f"                   Terminates on '{PASS_HOST}' AND '{PASS_DEV}'.")
+if args.dual_kvm:
+    print(f"  Dual-KVM       : both Systems on KVM cores, event queues")
+    print(f"                   renumbered disjoint (see [dual-kvm] line above).")
+    print(f"                   Success = both serials show kernel boot within")
+    print(f"                   ~1 min and both PASS strings in ~2-5 min.")
+    print(f"                   Attempt-A repro = serials still empty after ~3 min.")
 if args.offload:
     print(f"  Offload        : host_offload -> CXL mailbox @ 0x2ff000000 -> device_offload")
     print(f"  Host carve-out : memmap=16M$0x2ff000000 (Reserved, /dev/mem-mmappable)")
