@@ -1,6 +1,4 @@
-# -*- mode:python -*-
-
-# Copyright (c) 2006 The Regents of The University of Michigan
+# Copyright (c) 2021 The Regents of the University of California
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -26,36 +24,45 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-Import('*')
+from typing import Type
 
-SimObject('Cache.py', sim_objects=[
-    'WriteAllocator', 'BaseCache', 'Cache', 'NoncoherentCache'],
-    enums=['Clusivity'])
+from m5.objects import (
+    BasePrefetcher,
+    Cache,
+    StridePrefetcher,
+)
 
-Source('base.cc')
-Source('cache.cc')
-Source('cache_blk.cc')
-Source('metadata_cache.cc')
-Source('mshr.cc')
-Source('mshr_queue.cc')
-Source('noncoherent_cache.cc')
-Source('write_queue.cc')
-Source('write_queue_entry.cc')
+from .....utils.override import *
 
-DebugFlag('Cache')
-DebugFlag('CacheComp')
-DebugFlag('CachePort')
-DebugFlag('CacheRepl')
-DebugFlag('CacheTags')
-DebugFlag('CacheVerbose')
-DebugFlag('HWPrefetch')
-DebugFlag('MetadataCache')
-DebugFlag('MetadataCacheEviction')
-DebugFlag('MSHR')
-DebugFlag('HWPrefetchQueue')
 
-# CacheTags is so outrageously verbose, printing the cache's entire tag
-# array on each timing access, that you should probably have to ask for
-# it explicitly even above and beyond CacheAll.
-CompoundFlag('CacheAll', ['Cache', 'CacheComp', 'CachePort', 'CacheRepl',
-                          'CacheVerbose', 'HWPrefetch', 'MSHR'])
+class ClassicMetadataCache(Cache):
+    """
+    A simple metadata cache with default values.
+
+    If the cache has a mostly exclusive downstream cache, ``writeback_clean``
+    should be set to ``True``.
+    """
+
+    def __init__(
+        self,
+        size: str,
+        assoc: int = 8,
+        tag_latency: int = 1,
+        data_latency: int = 1,
+        response_latency: int = 1,
+        mshrs: int = 16,
+        tgts_per_mshr: int = 20,
+        writeback_clean: bool = False,
+        PrefetcherCls: Type[BasePrefetcher] = StridePrefetcher,
+    ):
+        super().__init__()
+        self.size = size
+        self.assoc = assoc
+        self.tag_latency = tag_latency
+        self.data_latency = data_latency
+        self.response_latency = response_latency
+        self.mshrs = mshrs
+        self.tgts_per_mshr = tgts_per_mshr
+        self.writeback_clean = writeback_clean
+        # self.prefetcher = PrefetcherCls(degree=2, queue_size=8,confidence_threshold=70)
+        self.prefetcher = PrefetcherCls()

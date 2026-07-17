@@ -78,11 +78,30 @@ blob_bytes.h: blob.bin
 	sed -i 's/blob_bin/cxl_blob/g' $@
 	@echo "Generated: $@"
 
+# XTEA cipher blob — same freestanding flags + verify gate as the FNV blob.
+blob_xtea.o: blob_xtea.c blob_abi.h
+	$(CC) $(BLOB_CFLAGS) -c -o $@ $<
+
+blob_xtea.bin: blob_xtea.o
+	@if objdump -r $< | grep -q 'RELOCATION RECORDS FOR \[.text\]'; then \
+		echo "ERROR: blob .text has relocations — not position-independent:"; \
+		objdump -r $<; exit 1; \
+	fi
+	@objdump -d $< | grep -qE '^0+ <entry>:' || { \
+		echo "ERROR: 'entry' is not at .text offset 0:"; objdump -d $<; exit 1; }
+	objcopy -O binary -j .text $< $@
+	@echo "Built: $@ ($$(wc -c < $@) bytes), entry@0, no .text relocs"
+
+blob_xtea_bytes.h: blob_xtea.bin
+	xxd -i $< > $@
+	sed -i 's/blob_xtea_bin/cxl_blob_xtea/g' $@
+	@echo "Generated: $@"
+
 # Host->device CXL offload: shared-memory mailbox + doorbell.
 # Both link no m5ops; both depend on the shared mailbox contract header.
 # host_offload bakes in the blob (blob_bytes.h); device_offload needs the
 # blob entry ABI (blob_abi.h).
-host_offload: host_offload.c cxl_mailbox.h blob_bytes.h
+host_offload: host_offload.c cxl_mailbox.h blob_bytes.h blob_xtea_bytes.h
 	$(CC) $(CFLAGS) -o $@ $<
 	@echo "Built: $@"
 
@@ -92,7 +111,7 @@ device_offload: device_offload.c cxl_mailbox.h blob_abi.h
 
 # Clean
 clean:
-	rm -f $(TARGETS) *.o blob.bin blob_bytes.h
+	rm -f $(TARGETS) *.o blob.bin blob_bytes.h blob_xtea.bin blob_xtea_bytes.h
 
 # Install to disk image (requires mount)
 install: $(TARGETS)

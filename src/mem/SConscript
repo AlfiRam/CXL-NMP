@@ -66,6 +66,13 @@ SimObject('XBar.py', sim_objects=[
 SimObject('HMCController.py', sim_objects=['HMCController'])
 SimObject('SerialLink.py', sim_objects=['SerialLink'])
 SimObject('MemDelay.py', sim_objects=['MemDelay', 'SimpleMemDelay'])
+SimObject('IntegrityVerifier.py', sim_objects=[
+    'AbstractIntegrityVerifier', 'IntegrityVerifier'],
+    enums=['IntegrityAllocationMode',
+           'IntegrityTreeType',
+           'MetadataCacheType',
+    ]
+)
 SimObject('PortTerminator.py', sim_objects=['PortTerminator'])
 SimObject('ThreadBridge.py', sim_objects=['ThreadBridge'])
 
@@ -105,6 +112,7 @@ Source('hmc_controller.cc')
 Source('htm.cc')
 Source('serial_link.cc')
 Source('mem_delay.cc')
+Source('integrity_verifier.cc')
 Source('port_terminator.cc')
 
 GTest('backdoor_manager.test', 'backdoor_manager.test.cc',
@@ -151,6 +159,15 @@ DebugFlag('DRAMState')
 DebugFlag('NVM')
 DebugFlag('ExternalPort')
 DebugFlag('HtmMem', 'Hardware Transactional Memory (Mem side)')
+DebugFlag('AbstractIntegrityVerifier')
+DebugFlag('AbstractIntegrityVerifierInit', 'Details for initialization of '
+          'integrity verifier')
+DebugFlag('AbstractIntegrityVerifierReqs', 'All requests received by an '
+          'integrity verifier')
+DebugFlag('AbstractIntegrityVerifierResps', 'All responses received by an '
+          'integrity verifier')
+DebugFlag('IntegrityNodeLocationMap', 'Information about how integrity nodes '
+          'are mapped to physical address locations')
 DebugFlag('LLSC')
 DebugFlag('MemCtrl')
 DebugFlag('MMU')

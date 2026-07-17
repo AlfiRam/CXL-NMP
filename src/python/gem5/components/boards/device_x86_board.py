@@ -58,6 +58,7 @@ from m5.objects import (
     Bridge,
     CowDiskImage,
     IdeDisk,
+    IntegrityVerifier,
     IOXBar,
     Pc,
     Port,
@@ -83,6 +84,7 @@ from ...isas import ISA
 from ...resources.resource import AbstractResource
 from ...utils.override import overrides
 from ..cachehierarchies.abstract_cache_hierarchy import AbstractCacheHierarchy
+from ..cachehierarchies.classic.caches.metadata import ClassicMetadataCache
 from ..memory.abstract_memory_system import AbstractMemorySystem
 from ..processors.abstract_processor import AbstractProcessor
 from .abstract_system_board import AbstractSystemBoard
@@ -137,11 +139,84 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
         # When None, nothing CXL-related is wired.
         cxl_mem_bus=None,
         cxl_mem_range: "AddrRange | None" = None,
+        # Optional device-side integrity verifier on the CXL-ingress path.
+        # When True (and CXL plumbing is present), an IntegrityVerifier is
+        # interposed between the device membus and device_iobridge so device
+        # reads of the shared CXL window traverse it. Default OFF -> the
+        # existing offload path is wired exactly as before.
+        cxl_integrity: bool = False,
+        cxl_integrity_tree_type: str = "TimingBmt",
+        cxl_integrity_tree_arity: int = 4,
+        cxl_integrity_full_ranges=None,
+        cxl_integrity_os_ranges=None,
+        cxl_integrity_metadata_cache_size: str = "128KiB",
+        cxl_integrity_metadata_cache_assoc: int = 8,
+        # §6.2 range-keyed subtree handoff. When True (requires cxl_integrity),
+        # the device verifier is handed AUTHORITY over a contiguous region at
+        # the start of the protected cxl_os range (size cxl_handoff_size): it
+        # re-roots its integrity walk for that range. Default OFF.
+        cxl_handoff: bool = False,
+        cxl_handoff_size: str = "1MiB",
     ) -> None:
         # Stash CXL params before super-style init so _setup_memory_ranges
         # and _setup_io_devices can see them.
         self._cxl_mem_bus = cxl_mem_bus
         self._cxl_mem_range = cxl_mem_range
+
+        # Device-side integrity verifier configuration. The protected region
+        # is the shared CXL WINDOW (CxlOnly), not device-local DRAM.
+        self._cxl_integrity = cxl_integrity
+        self._cxl_integrity_tree_type = cxl_integrity_tree_type
+        self._cxl_integrity_tree_arity = cxl_integrity_tree_arity
+        self._cxl_integrity_metadata_cache_size = cxl_integrity_metadata_cache_size
+        self._cxl_integrity_metadata_cache_assoc = cxl_integrity_metadata_cache_assoc
+        self._cxl_integrity_full_ranges = cxl_integrity_full_ranges
+        self._cxl_integrity_os_ranges = cxl_integrity_os_ranges
+        if cxl_integrity and cxl_mem_range is not None:
+            # Default carve-out: protect the bottom 2 GiB of the CXL window;
+            # EXCLUDE the top 16 MiB offload mailbox from `full` so it stays
+            # outside the verifier (offload traffic passes through inert) and
+            # so the integrity structure (top suffix of `full`) does not land
+            # on the mailbox. Integrity lands in [os_end, full_end).
+            base = int(cxl_mem_range.start)
+            win_size = int(cxl_mem_range.size())
+            full_end = base + win_size - toMemorySize("16MiB")  # drop mailbox
+            if self._cxl_integrity_full_ranges is None:
+                self._cxl_integrity_full_ranges = [AddrRange(base, full_end)]
+            if self._cxl_integrity_os_ranges is None:
+                os_end = base + toMemorySize("2GiB")
+                assert os_end < full_end, (
+                    "CXL integrity os range must fit below the metadata "
+                    "reserve (CXL window too small for the default carve)"
+                )
+                self._cxl_integrity_os_ranges = [AddrRange(base, os_end)]
+
+        # §6.2 range-keyed handoff region: place it at the START (offset 0) of
+        # the protected cxl_os range, sized cxl_handoff_size and MAC-granularity
+        # (64*arity) aligned. Passed to the verifier as handoff_range_*; the
+        # same base/size are threaded to the offload guests' OP_HANDOFF
+        # descriptor by the config. Default (off) -> 0/0 -> verifier inactive.
+        self._cxl_handoff = cxl_handoff
+        self._cxl_handoff_start = 0
+        self._cxl_handoff_size = 0
+        if cxl_handoff:
+            assert cxl_integrity, "cxl_handoff requires cxl_integrity"
+            assert self._cxl_integrity_os_ranges, (
+                "cxl_handoff needs a protected cxl_os range"
+            )
+            os_base = int(self._cxl_integrity_os_ranges[0].start)
+            os_size = int(self._cxl_integrity_os_ranges[0].size())
+            hsize = toMemorySize(cxl_handoff_size)
+            mac_gran = 64 * cxl_integrity_tree_arity
+            assert hsize % mac_gran == 0, (
+                f"cxl_handoff_size must be {mac_gran}-byte (MAC-granularity) "
+                "aligned"
+            )
+            assert hsize <= os_size, (
+                "cxl_handoff region exceeds the protected cxl_os range"
+            )
+            self._cxl_handoff_start = os_base
+            self._cxl_handoff_size = hsize
         # AbstractSystemBoard inherits from System, AbstractBoard, but
         # AbstractBoard.__init__ requires a cxl_memory and is_asic
         # parameter. We bypass AbstractSystemBoard.__init__ and call
@@ -336,9 +411,47 @@ class DeviceX86Board(AbstractSystemBoard, KernelDiskWorkload):
                 delay="50ns",
                 ranges=[self._cxl_mem_range],
             )
-            self.device_iobridge.cpu_side_port = (
-                self.get_cache_hierarchy().get_mem_side_port()
-            )
+            if self._cxl_integrity:
+                # Interpose the integrity verifier on the device's
+                # READ-FROM-CXL (ingress) seam: device CXL reads traverse it
+                # on the way out and the verified data on the way back. The
+                # verifier propagates the (whole-window) CXL range up to the
+                # membus, so only CXL traffic routes through it; device-local
+                # DRAM reads never reach device_iobridge and so never reach
+                # the verifier. Its CxlOnly ranges decide what is actually
+                # verified (the offload mailbox is excluded -> passes through).
+                self.cxl_verifier = IntegrityVerifier(
+                    integrity_allocation_mode="CxlOnly",
+                    integrity_tree_type=self._cxl_integrity_tree_type,
+                    integrity_tree_arity=self._cxl_integrity_tree_arity,
+                    cxl_full_ranges=self._cxl_integrity_full_ranges,
+                    cxl_os_ranges=self._cxl_integrity_os_ranges,
+                    # §6.2 range-keyed handoff (0/0 when disabled -> inactive).
+                    handoff_range_start=self._cxl_handoff_start,
+                    handoff_range_size=self._cxl_handoff_size,
+                )
+                self.cxl_metadata_cache = ClassicMetadataCache(
+                    size=self._cxl_integrity_metadata_cache_size,
+                    assoc=self._cxl_integrity_metadata_cache_assoc,
+                )
+                # membus -> verifier -> device_iobridge
+                self.cxl_verifier.cpu_side_port = (
+                    self.get_cache_hierarchy().get_mem_side_port()
+                )
+                self.device_iobridge.cpu_side_port = (
+                    self.cxl_verifier.mem_side_port
+                )
+                # metadata cache hangs off the verifier's metadata ports
+                self.cxl_metadata_cache.cpu_side = (
+                    self.cxl_verifier.metadata_req_port
+                )
+                self.cxl_verifier.metadata_resp_port = (
+                    self.cxl_metadata_cache.mem_side
+                )
+            else:
+                self.device_iobridge.cpu_side_port = (
+                    self.get_cache_hierarchy().get_mem_side_port()
+                )
             self.device_iobridge.mem_side_port = (
                 self._cxl_mem_bus.cpu_side_ports
             )

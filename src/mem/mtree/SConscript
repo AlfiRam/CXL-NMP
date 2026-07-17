@@ -1,0 +1,20 @@
+Import('*')
+
+Source('abstract_tree.cc')
+Source('timing_bmt.cc')
+Source('timing_tree.cc')
+Source('tree.cc')
+Source('util.cc')
+
+DebugFlag('IntegrityTree')
+DebugFlag('TimingBmt')
+DebugFlag('TimingBmtInit')
+DebugFlag('TimingTree')
+DebugFlag('TimingTreeInit')
+
+PySource('gem5.components.memory.mtree',
+    '__init__.py')
+PySource('gem5.components.memory.mtree',
+    'TimingBmt.py')
+PySource('gem5.components.memory.mtree',
+    'TimingTree.py')

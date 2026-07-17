@@ -8,6 +8,8 @@ nmp_ptr_chase_test
 host_offload
 device_offload
 
-# Generated OP_EXEC_BLOB artifacts (built from blob_fnv.c)
+# Generated OP_EXEC_BLOB artifacts (built from blob_fnv.c / blob_xtea.c)
 blob.bin
 blob_bytes.h
+blob_xtea.bin
+blob_xtea_bytes.h

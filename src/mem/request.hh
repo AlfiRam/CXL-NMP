@@ -470,6 +470,19 @@ class Request : public Extensible<Request>
     /** The cause for HTM transaction abort */
     HtmFailureFaultCause _htmAbortCause = HtmFailureFaultCause::INVALID;
 
+    /**
+     * Integrity-verifier metadata-request tagging (ported engine hook).
+     * When set, this request is a metadata (counter/MAC/tree-node) fetch
+     * rather than application data; _metadataNode is the target integrity-
+     * tree node index and _metadataType is its node kind (0 TreeNode,
+     * 1 Counter, 2 MAC).
+     */
+    bool _isMetadataRequest;
+
+    size_t _metadataNode;
+
+    size_t _metadataType;
+
   public:
 
     /**
@@ -477,7 +490,11 @@ class Request : public Extensible<Request>
      *  _flags and privateFlags are cleared by Flags default
      *  constructor.)
      */
-    Request() {}
+    Request() {
+        _isMetadataRequest = false;
+        _metadataNode = 0;
+        _metadataType = 0;
+    }
 
     /**
      * Constructor for physical (e.g. device) requests.  Initializes
@@ -490,6 +507,9 @@ class Request : public Extensible<Request>
         _flags.set(flags);
         privateFlags.set(VALID_PADDR|VALID_SIZE);
         _byteEnable = std::vector<bool>(size, true);
+        _isMetadataRequest = false;
+        _metadataNode = 0;
+        _metadataType = 0;
     }
 
     Request(Addr vaddr, unsigned size, Flags flags,
@@ -499,6 +519,9 @@ class Request : public Extensible<Request>
         setVirt(vaddr, size, flags, id, pc, std::move(atomic_op));
         setContext(cid);
         _byteEnable = std::vector<bool>(size, true);
+        _isMetadataRequest = false;
+        _metadataNode = 0;
+        _metadataType = 0;
     }
 
     Request(const Request& other)
@@ -514,6 +537,9 @@ class Request : public Extensible<Request>
           _extraData(other._extraData), _contextId(other._contextId),
           _pc(other._pc), _reqInstSeqNum(other._reqInstSeqNum),
           _localAccessor(other._localAccessor),
+          _isMetadataRequest(other._isMetadataRequest),
+          _metadataNode(other._metadataNode),
+          _metadataType(other._metadataType),
           translateDelta(other.translateDelta),
           accessDelta(other.accessDelta), depth(other.depth)
     {
@@ -522,6 +548,45 @@ class Request : public Extensible<Request>
     }
 
     ~Request() {}
+
+    /**
+     * Integrity-verifier metadata-request accessors (ported engine hook).
+     * Tag/read whether this request is a metadata fetch, which integrity-
+     * tree node it targets, and that node's type. PageSwapper accessors are
+     * intentionally not ported (PageSwapper is excised from this port).
+     */
+    void
+    setMetadataRequest(bool flag) {
+        _isMetadataRequest = flag;
+    }
+
+    bool
+    getMetadataRequest()
+    {
+        return _isMetadataRequest;
+    }
+
+    void
+    setMetadataNode(size_t node) {
+        _metadataNode = node;
+    }
+
+    size_t
+    getMetadataNode()
+    {
+        return _metadataNode;
+    }
+
+    void
+    setMetadataType(size_t type) {
+        _metadataType = type;
+    }
+
+    size_t
+    getMetadataType()
+    {
+        return _metadataType;
+    }
 
     /**
      * Factory method for creating memory management requests, with
