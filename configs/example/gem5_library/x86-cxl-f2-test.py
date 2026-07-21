@@ -213,8 +213,7 @@ class TwoSystemSimulator(Simulator):
         # array).
         kvm_cores = [
             c
-            for proc in (self._board.processor,
-                         self._device_board.processor)
+            for proc in (self._board.processor, self._device_board.processor)
             for c in proc.get_cores()
             if c.is_kvm_core()
         ]
@@ -246,14 +245,18 @@ class TwoSystemSimulator(Simulator):
         # Both processors use KVM, so sim_quantum is required for KVM
         # scheduling regardless of which we check. Set it unconditionally.
         host_proc = self._board.processor
-        dev_proc  = self._device_board.processor
+        dev_proc = self._device_board.processor
         any_kvm = (
             any(c.is_kvm_core() for c in host_proc.get_cores())
             or any(c.is_kvm_core() for c in dev_proc.get_cores())
-            or (isinstance(host_proc, SwitchableProcessor)
-                and any(c.is_kvm_core() for c in host_proc._all_cores()))
-            or (isinstance(dev_proc, SwitchableProcessor)
-                and any(c.is_kvm_core() for c in dev_proc._all_cores()))
+            or (
+                isinstance(host_proc, SwitchableProcessor)
+                and any(c.is_kvm_core() for c in host_proc._all_cores())
+            )
+            or (
+                isinstance(dev_proc, SwitchableProcessor)
+                and any(c.is_kvm_core() for c in dev_proc._all_cores())
+            )
         )
         if any_kvm:
             m5.ticks.fixGlobalFrequency()
@@ -344,6 +347,11 @@ def serial_barrier_handler(
                     os.path.join(checkpoint_dir, "TAKE_CMDLINE.txt"), "w"
                 ) as f:
                     f.write("taken by: " + " ".join(sys.argv) + "\n")
+                    # Machine-readable record; the restore-time check
+                    # parses this line and rejects a differing
+                    # --device-cores rather than failing at opaque
+                    # section-mismatch time.
+                    f.write(f"device_cores: {args.device_cores}\n")
                 print("[barrier] checkpoint written — ending simulation")
             print(
                 f"[barrier] both PASS strings seen "
@@ -449,7 +457,9 @@ def kvm_boot_barrier_handler(
 # =============================================================================
 requires(isa_required=ISA.X86)
 
-parser = argparse.ArgumentParser(description="Two-System x86 Linux smoke test.")
+parser = argparse.ArgumentParser(
+    description="Two-System x86 Linux smoke test."
+)
 parser.add_argument(
     "--is_asic",
     type=str,
@@ -519,6 +529,19 @@ parser.add_argument(
     "permission failure is not misread as the Attempt-A hang.",
 )
 parser.add_argument(
+    "--device-cores",
+    type=int,
+    default=2,
+    metavar="N",
+    help="Number of device cores (default: 2, the historical hardcoded "
+    "value). Used by BOTH device-processor branches (KVM and non-KVM). "
+    "Use 1 under --kvm-boot/--dual-kvm to sidestep the wait-for-SIPI AP "
+    "unpark issue (a parked KVM AP has no re-park path once a stray "
+    "interrupt wakes it; see the comment at the device-processor "
+    "construction). Checkpoints record this value; --restore rejects a "
+    "mismatch.",
+)
+parser.add_argument(
     "--offload",
     action="store_true",
     help="MVP host->device code offload over a shared CXL mailbox. Host "
@@ -555,7 +578,9 @@ args = parser.parse_args()
 if args.take_checkpoint and args.restore:
     parser.error("--take-checkpoint and --restore are mutually exclusive.")
 if args.offload and (args.take_checkpoint or args.restore):
-    parser.error("--offload cannot be combined with --take-checkpoint/--restore.")
+    parser.error(
+        "--offload cannot be combined with --take-checkpoint/--restore."
+    )
 if args.device_handoff and not args.device_integrity:
     parser.error("--device-handoff requires --device-integrity.")
 if args.device_handoff and not args.offload:
@@ -602,6 +627,31 @@ if args.kvm_boot and (args.take_checkpoint or args.restore):
     )
 if args.kvm_no_perf and not (args.dual_kvm or args.kvm_boot):
     parser.error("--kvm-no-perf only applies to --dual-kvm/--kvm-boot.")
+if args.device_cores < 1:
+    parser.error("--device-cores must be >= 1.")
+# A checkpoint serializes per-core state (CPU threads, per-core lapic
+# pendingInit/startedUp — interrupts.cc:774-801), so restoring with a
+# different device core count fails at opaque section-mismatch time.
+# Fail fast instead, using the count recorded in TAKE_CMDLINE.txt.
+# Checkpoints predating --device-cores carry no record; they were all
+# taken with the then-hardcoded 2.
+if args.restore:
+    _taken_cores = 2
+    try:
+        with open(os.path.join(args.restore, "TAKE_CMDLINE.txt")) as _f:
+            for _line in _f:
+                if _line.startswith("device_cores:"):
+                    _taken_cores = int(_line.split(":", 1)[1])
+    except FileNotFoundError:
+        pass
+    if _taken_cores != args.device_cores:
+        parser.error(
+            f"checkpoint {args.restore} was taken with device_cores="
+            f"{_taken_cores}, but this run requests --device-cores "
+            f"{args.device_cores}. Per-core state is serialized per core, "
+            f"so the topologies must match exactly; re-run with "
+            f"--device-cores {_taken_cores}."
+        )
 
 # Dev-speed vs timing-accurate selector. ATOMIC flips BOTH Systems'
 # SimpleProcessors; each board's incorporate_processor then sets its own
@@ -613,8 +663,10 @@ if args.kvm_no_perf and not (args.dual_kvm or args.kvm_boot):
 # 'atomic_noncaching' via the same incorporate_processor path; caches are
 # present but bypassed — irrelevant for the boot-only experiment).
 _cpu_type = (
-    CPUTypes.KVM if args.dual_kvm
-    else CPUTypes.ATOMIC if args.atomic
+    CPUTypes.KVM
+    if args.dual_kvm
+    else CPUTypes.ATOMIC
+    if args.atomic
     else CPUTypes.TIMING
 )
 
@@ -624,10 +676,14 @@ _cpu_type = (
 # the host-side regression test still passes against the same gem5 binary.
 # =============================================================================
 host_cache = PrivateL1PrivateL2SharedL3CacheHierarchy(
-    l1d_size="48kB",  l1d_assoc=6,
-    l1i_size="32kB",  l1i_assoc=8,
-    l2_size="2MB",    l2_assoc=16,
-    l3_size="96MB",   l3_assoc=48,
+    l1d_size="48kB",
+    l1d_assoc=6,
+    l1i_size="32kB",
+    l1i_assoc=8,
+    l2_size="2MB",
+    l2_assoc=16,
+    l3_size="96MB",
+    l3_assoc=48,
 )
 
 host_memory = DIMM_DDR5_4400(size="3GB")
@@ -682,7 +738,9 @@ cxl_mem_range = AddrRange(
 # private one
 # =============================================================================
 device_cache = PrivateL1PrivateL2CacheHierarchy(
-    l1d_size="32kB", l1i_size="32kB", l2_size="512kB",
+    l1d_size="32kB",
+    l1i_size="32kB",
+    l2_size="512kB",
 )
 device_memory = SingleChannelDDR3_1600(size="512MB")
 
@@ -690,27 +748,35 @@ device_memory = SingleChannelDDR3_1600(size="512MB")
 # module docstring). No switchable processor, no usePerf hack — those
 # are KVM-specific concerns.
 #
-# CORE-COUNT CHANGE — deliberately the ONLY edit in this hunk so it is
-# separable from the checkpoint/restore plumbing below. 2 cores is the
-# first step toward a multi-core (Structera-A-like) device. Everything
-# downstream already scales with get_num_cores(): the IntelMP table and
-# apicbridge range in device_x86_board.py, and per-core L1/L2 in the
-# cache hierarchy. NOTE: this is the repo's first multi-core boot under
-# pure TIMING (all prior 2-core boots used KVM, which is foreclosed in
-# two-System runs). If boot hangs in SMP bring-up, set num_cores back
-# to 1 to isolate this change.
+# DEVICE CORE COUNT — --device-cores N (default 2, the historical
+# hardcoded value); one variable feeds BOTH branches so the KVM and
+# non-KVM paths can never drift. The static plumbing scales correctly
+# via get_num_cores(): the IntelMP table and apicbridge range in
+# device_x86_board.py, and per-core L1/L2 in the cache hierarchy
+# (proven through SMP bring-up by the 2026-07 dual-KVM runs — the old
+# claim that multi-core KVM is foreclosed in two-System runs is
+# obsolete). The DYNAMIC caveat is under KVM: a wait-for-SIPI AP is
+# parked by tc->suspend() with nothing pending (fs_workload.cc:112-120),
+# but Interrupts::requestInterrupt unconditionally calls cpu->wakeup()
+# (interrupts.cc:271-273) and BaseKvmCPU::wakeup() activates any
+# suspended thread — and unlike the simulated CPUs' INIT-microcode halt
+# loop, a KVM core has no re-park path. A stray pre-SIPI interrupt
+# therefore leaves the AP executing reset-vector garbage until the real
+# INIT/SIPI (diagnosed 2026-07 on the nested-KVM machine). Until that
+# is fixed, use --device-cores 1 for KVM boots that hit SMP bring-up
+# hangs.
 if args.kvm_boot:
     device_processor = SimpleSwitchableProcessor(
         starting_core_type=CPUTypes.KVM,
         switch_core_type=CPUTypes.ATOMIC,
         isa=ISA.X86,
-        num_cores=2,
+        num_cores=args.device_cores,
     )
 else:
     device_processor = SimpleProcessor(
         cpu_type=_cpu_type,  # ATOMIC under --atomic; see _cpu_type above
         isa=ISA.X86,
-        num_cores=2,
+        num_cores=args.device_cores,
     )
 
 if args.kvm_no_perf:
@@ -748,7 +814,7 @@ device_board = DeviceX86Board(
 # in the guest reads its own command stream.
 # =============================================================================
 KERNEL_PATH = "/home/alfi/CXL-NMP/fs_files/vmlinux_20240920"
-DISK_PATH   = "/home/alfi/CXL-NMP/fs_files/parsec.img"
+DISK_PATH = "/home/alfi/CXL-NMP/fs_files/parsec.img"
 
 # Default (smoke-test) mode: one-shot PASS + m5 exit, unchanged.
 # Both Systems are TIMING from tick 0 — no leading `m5 exit;` (no switch).
@@ -783,10 +849,7 @@ device_cmd = (
 # on output generated POST-restore — which a periodic heartbeat is,
 # within ~2 simulated seconds of resume.
 _liveness_loop = (
-    "while true; do "
-    "echo 'host alive'; "
-    "m5 exit; sleep 2; "
-    "done"
+    "while true; do " "echo 'host alive'; " "m5 exit; sleep 2; " "done"
 )
 
 # CXL sentinel (device side). The DEVICE sees CXL as a Reserved E820
@@ -810,7 +873,7 @@ _liveness_loop = (
 # There is also no coherence between host caches and device-side CXL
 # writes — harmless while the host is parked idle.
 _CXL_SENTINEL = "CXLSENTINEL_F2_OK"  # 17 bytes, ASCII so serial shows it
-_CXL_SENTINEL_ADDR = 4295032832      # 0x100010000
+_CXL_SENTINEL_ADDR = 4295032832  # 0x100010000
 _write_sentinel = (
     f"printf '%s' '{_CXL_SENTINEL}' | "
     f"dd of=/dev/mem bs=1 seek={_CXL_SENTINEL_ADDR} conv=notrunc 2>/dev/null; "
@@ -827,11 +890,7 @@ _device_loop = (
 )
 if args.take_checkpoint or args.restore:
     host_cmd = "echo 'host boot OK'; " + _liveness_loop
-    device_cmd = (
-        "echo 'device boot OK'; "
-        + _write_sentinel
-        + _device_loop
-    )
+    device_cmd = "echo 'device boot OK'; " + _write_sentinel + _device_loop
     # In restore mode these contents are never read by the guests (the
     # parked script reads nothing); they are written only so the
     # config-time file plumbing is identical to the take-run.
@@ -854,9 +913,7 @@ if args.offload:
         # already configured with the same range at instantiation.
         _ho_base = device_board._cxl_handoff_start
         _ho_size = device_board._cxl_handoff_size
-        _host_work = (
-            f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size};"
-        )
+        _host_work = f"/home/cxl_benchmark/host_offload handoff {_ho_base:#x} {_ho_size};"
     else:
         _host_work = "/home/cxl_benchmark/host_offload;"
     _device_work = "/home/cxl_benchmark/device_offload;"
@@ -907,27 +964,23 @@ if args.kvm_boot:
         _host_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
             "echo 'host phase2 start (ATOMIC)'\n"
-            f"{_host_work}\n"
-            + _KVM_PHASE2_TAIL
+            f"{_host_work}\n" + _KVM_PHASE2_TAIL
         )
         _device_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
             "echo 'device phase2 start (ATOMIC)'\n"
-            f"{_device_work}\n"
-            + _KVM_PHASE2_TAIL
+            f"{_device_work}\n" + _KVM_PHASE2_TAIL
         )
     else:
         # Plain --kvm-boot smoke: phase 2 just proves the switch landed and
         # the guests still execute post-switch.
         _host_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
-            "echo 'host post-switch OK'\n"
-            + _KVM_PHASE2_TAIL
+            "echo 'host post-switch OK'\n" + _KVM_PHASE2_TAIL
         )
         _device_phase2 = (
             f"# {_KVM_PHASE2_MARKER}\n"
-            "echo 'device post-switch OK'\n"
-            + _KVM_PHASE2_TAIL
+            "echo 'device post-switch OK'\n" + _KVM_PHASE2_TAIL
         )
     host_cmd = _kvm_phase1("host boot OK")
     device_cmd = _kvm_phase1("device boot OK")
@@ -957,9 +1010,9 @@ if args.offload:
         # keeps out (and the mapping is UC, atomic-safe, like the mailbox).
         _ho_base = device_board._cxl_handoff_start
         _ho_size = device_board._cxl_handoff_size
-        assert _ho_size % (1 << 20) == 0, (
-            "handoff region size must be MiB-aligned for the memmap= carve"
-        )
+        assert (
+            _ho_size % (1 << 20) == 0
+        ), "handoff region size must be MiB-aligned for the memmap= carve"
         _host_memmap_args.append(f"memmap={_ho_size >> 20}M${_ho_base:#x}")
     host_workload_kwargs["kernel_args"] = (
         host_board.get_default_kernel_args() + _host_memmap_args
@@ -990,7 +1043,7 @@ device_board.set_kernel_disk_workload(
 # src/sim/Root.py) and gem5 names the vector's child file
 # `systems.pc.com_1.device` (confirmed empirically — gem5 strips the
 # index suffix when there's a single entry).
-HOST_SERIAL   = os.path.join(m5.options.outdir, "board.pc.com_1.device")
+HOST_SERIAL = os.path.join(m5.options.outdir, "board.pc.com_1.device")
 DEVICE_SERIAL = os.path.join(m5.options.outdir, "systems.pc.com_1.device")
 
 # Restored runs key on the heartbeats (generated post-restore in the
@@ -1057,31 +1110,50 @@ simulator = TwoSystemSimulator(
 )
 
 _cpu_label = (
-    "KVM->ATOMIC" if args.kvm_boot
-    else "KVM" if args.dual_kvm
-    else "ATOMIC" if args.atomic
+    "KVM->ATOMIC"
+    if args.kvm_boot
+    else "KVM"
+    if args.dual_kvm
+    else "ATOMIC"
+    if args.atomic
     else "TIMING"
 )
 print("=" * 80)
 print(f"Two-System smoke test: {_cpu_label}-only + serial-output barrier")
 print("=" * 80)
-print(f"  CPU mode       : {'ATOMIC (dev-speed, no timing fidelity)' if args.atomic else 'TIMING'}")
-print(f"  Host board     : X86Board  ({_cpu_label}-only)  with CXLNMPDevice etc.")
-print(f"  Device board   : DeviceX86Board  ({_cpu_label}-only)  + device_iobridge")
+print(
+    f"  CPU mode       : {'ATOMIC (dev-speed, no timing fidelity)' if args.atomic else 'TIMING'}"
+)
+print(
+    f"  Host board     : X86Board  ({_cpu_label}-only)  with CXLNMPDevice etc."
+)
+print(
+    f"  Device board   : DeviceX86Board  ({_cpu_label}-only)  + device_iobridge"
+)
 print(f"  cxl_mem_bus    : host_board.cxl_mem_bus  (CXLMemBar, 3 masters)")
-print(f"  CXL range      : 0x100000000, size {host_board.get_cxl_memory().get_size_str()}")
+print(
+    f"  CXL range      : 0x100000000, size {host_board.get_cxl_memory().get_size_str()}"
+)
 print(f"  Host readfile  : {os.path.join(m5.options.outdir, 'host_readfile')}")
-print(f"  Dev  readfile  : {os.path.join(m5.options.outdir, 'device_readfile')}")
+print(
+    f"  Dev  readfile  : {os.path.join(m5.options.outdir, 'device_readfile')}"
+)
 print(f"  Host serial    : {HOST_SERIAL}")
 print(f"  Dev  serial    : {DEVICE_SERIAL}")
 print(f"  Barrier        : sim ends when BOTH PASS strings appear in serial")
 print(f"                   ('{PASS_HOST}' AND '{PASS_DEV}')")
-print(f"  Wall-clock     : {'~minutes cold boot (ATOMIC dev-speed)' if args.atomic else 'both ~25-30 min cold boot (parallel under TIMING)'}")
+print(
+    f"  Wall-clock     : {'~minutes cold boot (ATOMIC dev-speed)' if args.atomic else 'both ~25-30 min cold boot (parallel under TIMING)'}"
+)
 mode = (
-    "take-checkpoint" if args.take_checkpoint
-    else "restore" if args.restore
-    else "offload" if args.offload
-    else "dual-kvm boot experiment" if args.dual_kvm
+    "take-checkpoint"
+    if args.take_checkpoint
+    else "restore"
+    if args.restore
+    else "offload"
+    if args.offload
+    else "dual-kvm boot experiment"
+    if args.dual_kvm
     else "smoke-test"
 )
 if args.kvm_boot:
@@ -1096,29 +1168,55 @@ if args.kvm_boot:
     print(f"                   Terminates on '{PASS_HOST}' AND '{PASS_DEV}'.")
 if args.dual_kvm:
     print(f"  Dual-KVM       : both Systems on KVM cores, event queues")
-    print(f"                   renumbered disjoint (see [dual-kvm] line above).")
+    print(
+        f"                   renumbered disjoint (see [dual-kvm] line above)."
+    )
     print(f"                   Success = both serials show kernel boot within")
     print(f"                   ~1 min and both PASS strings in ~2-5 min.")
-    print(f"                   Attempt-A repro = serials still empty after ~3 min.")
+    print(
+        f"                   Attempt-A repro = serials still empty after ~3 min."
+    )
 if args.offload:
-    print(f"  Offload        : host_offload -> CXL mailbox @ 0x2ff000000 -> device_offload")
-    print(f"  Host carve-out : memmap=16M$0x2ff000000 (Reserved, /dev/mem-mmappable)")
+    print(
+        f"  Offload        : host_offload -> CXL mailbox @ 0x2ff000000 -> device_offload"
+    )
+    print(
+        f"  Host carve-out : memmap=16M$0x2ff000000 (Reserved, /dev/mem-mmappable)"
+    )
     if args.device_handoff:
         _ho_base = device_board._cxl_handoff_start
         _ho_size = device_board._cxl_handoff_size
-        print(f"  Handoff region : [{_ho_base:#x}..{_ho_base + _ho_size:#x}) "
-              f"(protected; verifier re-roots)")
-        print(f"  Handoff carve  : memmap={_ho_size >> 20}M${_ho_base:#x} "
-              f"(host Reserved; operands live at {_ho_base + 0x1000:#x})")
-        print(f"  Data binding   : blob in mailbox (control), XTEA operands in")
-        print(f"                   the handed-off PROTECTED region (data path);")
-        print(f"                   ciphertext match proves the device computed")
+        print(
+            f"  Handoff region : [{_ho_base:#x}..{_ho_base + _ho_size:#x}) "
+            f"(protected; verifier re-roots)"
+        )
+        print(
+            f"  Handoff carve  : memmap={_ho_size >> 20}M${_ho_base:#x} "
+            f"(host Reserved; operands live at {_ho_base + 0x1000:#x})"
+        )
+        print(
+            f"  Data binding   : blob in mailbox (control), XTEA operands in"
+        )
+        print(
+            f"                   the handed-off PROTECTED region (data path);"
+        )
+        print(
+            f"                   ciphertext match proves the device computed"
+        )
         print(f"                   on data read out of the protected region.")
-    print(f"  Success        : 'HOST OFFLOAD ... OK' AND 'DEVICE OFFLOAD done ...'")
+    print(
+        f"  Success        : 'HOST OFFLOAD ... OK' AND 'DEVICE OFFLOAD done ...'"
+    )
     print(f"  NOTE           : barrier also ends on failure — every exit path")
-    print(f"                   prints HOST/DEVICE OFFLOAD (OK/FAIL/TIMEOUT/ERROR).")
-    print(f"                   Requires host_offload + device_offload installed")
-    print(f"                   in the guest image (benchmarks/Makefile install).")
+    print(
+        f"                   prints HOST/DEVICE OFFLOAD (OK/FAIL/TIMEOUT/ERROR)."
+    )
+    print(
+        f"                   Requires host_offload + device_offload installed"
+    )
+    print(
+        f"                   in the guest image (benchmarks/Makefile install)."
+    )
 if args.take_checkpoint:
     print(f"  Checkpoint dir : {args.take_checkpoint}")
     print(f"  Barrier extra  : device must heartbeat 'CXL={_CXL_SENTINEL}'")
